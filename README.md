@@ -55,57 +55,60 @@ go run .
 
 ## Usage
 
-### Basic Usage
+### Default Smart Scan
 
+By default, `goclean` intelligently discovers all Go projects located in standard paths (`~/go` and `$GOPATH/src`) and analyzes their dependencies to find truly orphaned caches across your entire system.
+
+Simply run:
 ```bash
-# Use default settings
 goclean
-
-# Enable verbose output mode
-goclean -verbose
-
-# Dry run (don't actually delete files)
-goclean -dry-run
-
-# Show help information
-goclean -help
-
-# Show version information
-goclean -version
 ```
+
+The tool will automatically:
+1.  **Discover** all `go.mod` files in common workspaces.
+2.  **Analyze** the complete dependency graph of all found projects.
+3.  **Identify** modules in `$GOMODCACHE` that are not used by any of these projects.
+4.  **Present** an interactive menu to view details and confirm deletion.
 
 ### Specify Scan Paths
 
+If you want to limit the dependency analysis to specific projects, use the `-modules` flag with a comma-separated list of paths.
+
 ```bash
-# Specify Go workspace directory
-goclean -modules ~/go
+# Analyze only a single project
+goclean -modules /path/to/your/project
 
-# Specify multiple directories if needed (comma-separated)
-goclean -modules ~/go,~/legacy-projects
-
-# Specify specific go.mod files
-goclean -modules ~/go/myproject/go.mod,~/go/anotherproject/go.mod
+# Analyze multiple specific projects
+goclean -modules /path/to/projectA,/path/to/projectB
 ```
 
-### Interactive Operation
+### Dry Run
 
-When the tool finds unused modules, it will display an interactive interface similar to the following:
+To see which modules would be deleted without actually removing any files, use the `-dry-run` flag. This is highly recommended for the first run.
 
-```
-Found 147 unused modules, occupying 435.2 MB disk space.
-
-You can:
-(1) View details
-(2) Delete these modules (requires administrator privileges)
-(3) Exit
-
-Please enter the number in parentheses:
+```bash
+goclean -dry-run
 ```
 
-Option selection:
-- **1**: Display detailed information for all unused modules (module path, version, size, type)
-- **2**: Delete all unused modules after confirmation
-- **3**: Exit the program
+### Verbose Mode
+
+For more detailed output during the scanning and analysis process, use the `-verbose` flag.
+
+```bash
+goclean -verbose
+```
+
+### Help and Version
+
+To see all available options or check the current version, use the `-help` or `-version` flags.
+
+```bash
+goclean -help
+goclean -version
+```
+
+## Example
+For detailed examples of the output, please see [example.md](example.md).
 
 ## Command Line Options
 

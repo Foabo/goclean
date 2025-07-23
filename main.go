@@ -26,30 +26,41 @@ func main() {
 	}
 
 	if *showVersion {
-		fmt.Println("goclean v1.0.0")
+		fmt.Println("goclean v1.1.0") // Updated version
 		fmt.Println("Go Module Cache Intelligent Cleaner")
 		return
 	}
 
-	// Parse module paths
+	// New smart default behavior
 	var paths []string
-	if *modulePaths != "" {
+	if *modulePaths == "" {
+		fmt.Println("🔎 No specific module paths provided, discovering projects automatically...")
+		discoveredProjects, err := DiscoverGoProjects()
+		if err != nil {
+			fmt.Printf("❌ Error during project discovery: %v\n", err)
+			os.Exit(1)
+		}
+
+		if len(discoveredProjects) > 0 {
+			fmt.Printf("✅ Found %d projects. Analyzing their dependencies...\n", len(discoveredProjects))
+			paths = discoveredProjects
+			if *verbose {
+				fmt.Println("   Projects to be scanned:")
+				for _, p := range discoveredProjects {
+					fmt.Printf("   - %s\n", p)
+				}
+			}
+		} else {
+			fmt.Println("⚠️ No Go projects found in standard locations (~/go, $GOPATH/src).")
+			fmt.Println("   To analyze specific projects, use the -modules flag.")
+			fmt.Println("   Proceeding to find all modules not used by any discovered project (which is none).")
+			// An empty 'paths' slice will result in finding all modules as unused.
+		}
+		fmt.Println() // Add a newline for better readability
+	} else {
 		rawPaths := strings.Split(*modulePaths, ",")
 		for _, path := range rawPaths {
 			paths = append(paths, strings.TrimSpace(path))
-		}
-	}
-
-	// If no module paths specified, use default path
-	if len(paths) == 0 {
-		defaultPath, err := getDefaultModulePath()
-		if err != nil {
-			fmt.Printf("❌ Failed to get default module path: %v\n", err)
-			os.Exit(1)
-		}
-		paths = []string{defaultPath}
-		if *verbose {
-			fmt.Printf("Using default module path: %s\n", defaultPath)
 		}
 	}
 
@@ -82,20 +93,18 @@ func main() {
 func runCleaner(cleaner *ModuleCleaner) error {
 	fmt.Println("🚀 Starting Go module cache cleaning...")
 
-	// 1. Analyze project dependencies
-	fmt.Println("📊 Analyzing project dependencies...")
+	// Analyze dependencies
 	if err := cleaner.AnalyzeDependencies(); err != nil {
-		return fmt.Errorf("dependency analysis failed: %w", err)
+		return err
 	}
 
-	// 2. Find unused modules
-	fmt.Println("🔍 Finding unused modules...")
+	// Find unused modules
 	unusedModules, err := cleaner.FindUnusedModules()
 	if err != nil {
-		return fmt.Errorf("finding unused modules failed: %w", err)
+		return err
 	}
 
-	// 3. Show interactive menu
+	// Show interactive menu for cleaning
 	return cleaner.ShowInteractiveMenu(unusedModules)
 }
 

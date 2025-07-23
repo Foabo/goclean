@@ -318,9 +318,23 @@ func (mc *ModuleCleaner) parseDownloadedModulePath(fullPath, downloadDir string)
 		return ""
 	}
 
-	// Remove filename, get module path
+	// The structure is typically .../module/path/@v/version.zip
+	// We need to extract the 'module/path' part.
 	dir := filepath.Dir(relativePath)
-	if dir == "." {
+	
+	// Remove the version part (e.g., @v)
+	if strings.HasSuffix(dir, "@v") {
+		dir = strings.TrimSuffix(dir, "@v")
+		// Also trim any path separator that might be left
+		dir = strings.TrimSuffix(dir, string(filepath.Separator))
+	} else if strings.Contains(dir, "@") {
+		// Handle cases where the structure might be different but still contains '@'
+		// This is a safeguard, the primary logic targets the '@v' suffix.
+		parts := strings.Split(dir, "@")
+		dir = parts[0]
+	}
+
+	if dir == "." || dir == "" {
 		return ""
 	}
 

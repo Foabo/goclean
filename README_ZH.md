@@ -53,59 +53,62 @@ sudo mv goclean /usr/local/bin/
 go run .
 ```
 
-## 使用方法
+## 用法
 
-### 基本使用
+### 默认智能扫描
 
+默认情况下，`goclean` 会智能地发现位于标准路径（`~/go` 和 `$GOPATH/src`）下的所有 Go 项目，并分析它们的依赖关系，以找出您整个系统中真正的孤儿缓存。
+
+只需运行：
 ```bash
-# 使用默认设置
 goclean
-
-# 启用详细输出模式
-goclean -verbose
-
-# 模拟运行（不实际删除文件）
-goclean -dry-run
-
-# 显示帮助信息
-goclean -help
-
-# 显示版本信息
-goclean -version
 ```
+
+该工具将自动：
+1.  **发现** 常见工作区中的所有 `go.mod` 文件。
+2.  **分析** 所有已发现项目的完整依赖图。
+3.  **识别** `$GOMODCACHE` 中未被任何这些项目使用的模块。
+4.  **提供** 一个交互式菜单来查看详情并确认删除。
 
 ### 指定扫描路径
 
+如果您想将依赖分析限制在特定的项目，请使用 `-modules` 标志，并提供一个用逗号分隔的路径列表。
+
 ```bash
-# 指定Go工作空间目录
-goclean -modules ~/go
+# 仅分析单个项目
+goclean -modules /path/to/your/project
 
-# 需要时指定多个目录（用逗号分隔）
-goclean -modules ~/go,~/legacy-projects
-
-# 指定具体的go.mod文件
-goclean -modules ~/go/myproject/go.mod,~/go/anotherproject/go.mod
+# 分析多个指定的项目
+goclean -modules /path/to/projectA,/path/to/projectB
 ```
 
-### 交互式操作
+### 模拟运行 (Dry Run)
 
-当工具发现未使用的模块时，会显示类似以下的交互界面：
+如果您想查看哪些模块将被删除，而无需实际删除任何文件，请使用 `-dry-run` 标志。强烈建议在首次运行时使用此标志。
 
-```
-发现 147 个未使用的模块，占用 435.2 MB 磁盘空间。
-
-您可以:
-(1) 查看详细信息
-(2) 删除这些模块 (需要管理员权限)
-(3) 退出
-
-请输入括号中的数字:
+```bash
+goclean -dry-run
 ```
 
-选择选项：
-- **1**: 显示所有未使用模块的详细信息（模块路径、版本、大小、类型）
-- **2**: 确认后删除所有未使用的模块
-- **3**: 退出程序
+### 详细模式 (Verbose)
+
+要在扫描和分析过程中获得更详细的输出，请使用 `-verbose` 标志。
+
+```bash
+goclean -verbose
+```
+
+### 帮助与版本
+
+要查看所有可用选项或检查当前版本，请使用 `-help` 或 `-version` 标志。
+
+```bash
+goclean -help
+goclean -version
+```
+
+## 示例
+关于输出的详细示例，请参阅 [example_ZH.md](example_ZH.md)。
 
 ## 命令行选项
 

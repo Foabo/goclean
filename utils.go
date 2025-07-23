@@ -72,6 +72,67 @@ func FormatSize(bytes int64) string {
 	return fmt.Sprintf("%.1f %s", float64(bytes)/float64(div), units[exp+1])
 }
 
+// DiscoverGoProjects automatically finds Go projects in common locations.
+// It searches for go.mod files in ~/go and $GOPATH/src.
+func DiscoverGoProjects() ([]string, error) {
+	var projectDirs []string
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		return nil, fmt.Errorf("could not get user home directory: %w", err)
+	}
+
+	gopath, err := GetGOPATH()
+	if err != nil {
+		// GOPATH might not be set, which is not a fatal error.
+		if os.Getenv("GOCLEAN_VERBOSE") == "true" {
+			fmt.Println("Warning: Could not determine GOPATH. Search will be limited to ~/go.")
+		}
+		gopath = "" // Ensure gopath is empty if not found
+	}
+
+	// Define standard search paths
+	searchPaths := []string{
+		filepath.Join(homeDir, "go"), // Modern default
+	}
+	if gopath != "" {
+		searchPaths = append(searchPaths, filepath.Join(gopath, "src")) // Legacy GOPATH
+	}
+
+	foundProjects := make(map[string]bool)
+
+	for _, path := range searchPaths {
+		if _, err := os.Stat(path); os.IsNotExist(err) {
+			continue // Skip paths that don't exist
+		}
+
+		walkErr := filepath.Walk(path, func(modPath string, info os.FileInfo, err error) error {
+			if err != nil {
+				// Ignore errors from paths we can't access
+				return nil
+			}
+
+			// Skip vendor directories and the module cache itself to avoid deep crawls
+			if info.IsDir() && (info.Name() == "vendor" || info.Name() == "pkg" || info.Name() == ".git") {
+				return filepath.SkipDir
+			}
+
+			if !info.IsDir() && info.Name() == "go.mod" {
+				projectDir := filepath.Dir(modPath)
+				if !foundProjects[projectDir] {
+					projectDirs = append(projectDirs, projectDir)
+					foundProjects[projectDir] = true
+				}
+			}
+			return nil
+		})
+
+		if walkErr != nil {
+			fmt.Printf("Warning: error walking path %s: %v\n", path, walkErr)
+		}
+	}
+	return projectDirs, nil
+}
+
 // calculateDirectorySize calculates directory total size (concurrent version)
 func (mc *ModuleCleaner) calculateDirectorySize(dirPath string) (int64, error) {
 	var totalSize int64
