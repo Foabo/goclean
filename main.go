@@ -27,7 +27,7 @@ func main() {
 	}
 
 	if *showVersion {
-		fmt.Println("goclean v1.0.0") // Updated version
+		fmt.Println("goclean v1.1.0")
 		fmt.Println("Go Module Cache Intelligent Cleaner")
 		return
 	}

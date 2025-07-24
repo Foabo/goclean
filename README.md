@@ -268,10 +268,18 @@ For detailed explanation of Go module cache structure:
    ```
 3. Users can install specific version:
    ```bash
-   go install github.com/foabo/goclean@v1.0.0
+   go install github.com/foabo/goclean@v1.1.0
    ```
 
 ### Version History
+
+- **v1.1.0**: Enhanced path resolution support
+  - Support for current directory (`.`) and relative paths (`./project`)
+  - Environment variable expansion (`$GOPATH`, `$GOMODCACHE`, `$HOME`)
+  - Improved error handling and user feedback
+  - Enhanced enterprise environment configuration detection
+  - Fixed async progress display with atomic counters
+  - Better path validation and expansion
 
 - **v1.0.0**: Initial release with intelligent dependency analysis, cache scanning and cleaning, interactive interface, and concurrent performance optimization
 

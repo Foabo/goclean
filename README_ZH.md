@@ -268,10 +268,18 @@ go list -m -json all
    ```
 3. 用户可以安装特定版本:
    ```bash
-   go install github.com/foabo/goclean@v1.0.0
+   go install github.com/foabo/goclean@v1.1.0
    ```
 
 ### 版本历史
+
+- **v1.1.0**: 增强的路径解析支持
+  - 支持当前目录（`.`）和相对路径（`./project`）
+  - 环境变量扩展（`$GOPATH`、`$GOMODCACHE`、`$HOME`）
+  - 改进的错误处理和用户反馈
+  - 增强的企业环境配置检测
+  - 修复异步进度显示，使用原子计数器
+  - 更好的路径验证和扩展
 
 - **v1.0.0**: 初始版本，包含智能依赖分析、缓存扫描和清理、交互式界面以及并发性能优化
 
