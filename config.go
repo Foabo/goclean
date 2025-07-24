@@ -14,6 +14,8 @@ type Config struct {
 	DryRun bool
 	// GoModCache Go module cache directory, defaults to $GOMODCACHE
 	GoModCache string
+	// FastMode skip indirect dependencies analysis for faster processing
+	FastMode bool
 }
 
 // DefaultConfig returns default configuration
@@ -28,7 +30,7 @@ func DefaultConfig() *Config {
 }
 
 // NewConfig creates a new configuration instance
-func NewConfig(modulePaths []string, verbose, dryRun bool) (*Config, error) {
+func NewConfig(modulePaths []string, verbose, dryRun, fastMode bool) (*Config, error) {
 	gomodcache, err := GetGOMODCACHE()
 	if err != nil {
 		return nil, fmt.Errorf("failed to get GOMODCACHE: %w", err)
@@ -38,6 +40,7 @@ func NewConfig(modulePaths []string, verbose, dryRun bool) (*Config, error) {
 		ModulePaths: modulePaths,
 		Verbose:     verbose,
 		DryRun:      dryRun,
+		FastMode:    fastMode,
 		GoModCache:  gomodcache,
 	}, nil
 }

@@ -14,6 +14,7 @@ func main() {
 		modulePaths = flag.String("modules", "", "Module paths to scan, comma-separated")
 		verbose     = flag.Bool("verbose", false, "Enable verbose output mode")
 		dryRun      = flag.Bool("dry-run", false, "Only simulate run, don't actually delete files")
+		fastMode    = flag.Bool("fast", false, "Fast mode: skip indirect dependencies analysis")
 		showHelp    = flag.Bool("help", false, "Show help information")
 		showVersion = flag.Bool("version", false, "Show version information")
 	)
@@ -65,7 +66,7 @@ func main() {
 	}
 
 	// Create configuration
-	config, err := NewConfig(paths, *verbose, *dryRun)
+	config, err := NewConfig(paths, *verbose, *dryRun, *fastMode)
 	if err != nil {
 		fmt.Printf("❌ Failed to create configuration: %v\n", err)
 		os.Exit(1)
@@ -77,6 +78,7 @@ func main() {
 		fmt.Printf("  - Scan paths: %v\n", config.ModulePaths)
 		fmt.Printf("  - Verbose mode: %t\n", config.Verbose)
 		fmt.Printf("  - Dry run: %t\n", config.DryRun)
+		fmt.Printf("  - Fast mode: %t\n", config.FastMode)
 		fmt.Println()
 	}
 
@@ -154,6 +156,7 @@ Options:
   -modules string    Module paths to scan, comma-separated
   -verbose           Enable verbose output mode
   -dry-run           Only simulate run, don't actually delete files
+  -fast              Fast mode: skip indirect dependencies analysis
   -help              Show this help information
   -version           Show version information
 

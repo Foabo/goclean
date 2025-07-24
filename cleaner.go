@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -10,6 +11,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/mod/modfile"
@@ -18,9 +20,10 @@ import (
 
 // ModuleCleaner Go module cache cleaner
 type ModuleCleaner struct {
-	config      *Config
-	usedModules map[string]bool // Set of modules in use
-	mutex       sync.RWMutex    // Protect concurrent access
+	config           *Config
+	usedModules      map[string]bool // Set of modules in use
+	mutex            sync.RWMutex    // Protect concurrent access
+	analyzedProjects map[string]bool // Cache for already analyzed projects
 }
 
 // ModuleInfo module information
@@ -39,20 +42,55 @@ func NewModuleCleaner(config *Config) *ModuleCleaner {
 	}
 }
 
-// AnalyzeDependencies analyzes project dependencies
+// AnalyzeDependencies analyzes dependencies from all specified module paths
 func (mc *ModuleCleaner) AnalyzeDependencies() error {
 	if mc.config.Verbose {
-		fmt.Println("Starting to analyze project dependencies...")
+		fmt.Printf("🔍 Analyzing %d module paths...\n", len(mc.config.ModulePaths))
 	}
 
-	for _, modPath := range mc.config.ModulePaths {
-		if err := mc.analyzeModulePath(modPath); err != nil {
-			return fmt.Errorf("failed to analyze module path %s: %w", modPath, err)
-		}
+	// 使用 worker pool 并发处理项目
+	const maxWorkers = 3 // 限制并发数以避免过度占用系统资源
+	semaphore := make(chan struct{}, maxWorkers)
+	var wg sync.WaitGroup
+	var analysisErrors []error
+	var errorMutex sync.Mutex
+
+	totalPaths := len(mc.config.ModulePaths)
+	processed := int32(0)
+
+	for i, modPath := range mc.config.ModulePaths {
+		wg.Add(1)
+		go func(index int, path string) {
+			defer wg.Done()
+			semaphore <- struct{}{}        // 获取信号量
+			defer func() { <-semaphore }() // 释放信号量
+
+			if mc.config.Verbose {
+				fmt.Printf("[%d/%d] Processing: %s\n", index+1, totalPaths, path)
+			}
+
+			if err := mc.analyzeModulePath(path); err != nil {
+				errorMutex.Lock()
+				analysisErrors = append(analysisErrors, fmt.Errorf("failed to analyze %s: %w", path, err))
+				errorMutex.Unlock()
+			}
+
+			// 更新进度
+			current := atomic.AddInt32(&processed, 1)
+			if mc.config.Verbose {
+				fmt.Printf("✅ [%d/%d] Completed: %s\n", current, totalPaths, path)
+			}
+		}(i, modPath)
 	}
 
+	wg.Wait()
+
+	// 报告分析结果
 	if mc.config.Verbose {
-		fmt.Printf("Found %d modules in use\n", len(mc.usedModules))
+		fmt.Printf("📊 Analysis complete: %d projects processed\n", totalPaths)
+		if len(analysisErrors) > 0 {
+			fmt.Printf("⚠️  %d projects had analysis errors (non-fatal)\n", len(analysisErrors))
+		}
 	}
 
 	return nil
@@ -126,24 +164,72 @@ func (mc *ModuleCleaner) analyzeGoModFile(goModPath string) error {
 		}
 	}
 
+	// 在快速模式下跳过间接依赖分析
+	if mc.config.FastMode {
+		if mc.config.Verbose {
+			fmt.Printf("    Fast mode: skipping indirect dependencies for %s\n", filepath.Dir(goModPath))
+		}
+		return nil
+	}
+
 	// Get complete dependency graph (including indirect dependencies)
 	return mc.analyzeIndirectDependencies(filepath.Dir(goModPath))
 }
 
-// analyzeIndirectDependencies uses go list to get indirect dependencies
+// analyzeIndirectDependencies 分析间接依赖（优化版本）
 func (mc *ModuleCleaner) analyzeIndirectDependencies(projectDir string) error {
-	cmd := exec.Command("go", "list", "-m", "-json", "all")
+	// 添加缓存机制，避免重复分析相同项目
+	if mc.analyzedProjects == nil {
+		mc.analyzedProjects = make(map[string]bool)
+	}
+
+	absProjectDir, err := filepath.Abs(projectDir)
+	if err != nil {
+		absProjectDir = projectDir
+	}
+
+	if mc.analyzedProjects[absProjectDir] {
+		if mc.config.Verbose {
+			fmt.Printf("  Skipping already analyzed project: %s\n", projectDir)
+		}
+		return nil
+	}
+	mc.analyzedProjects[absProjectDir] = true
+
+	if mc.config.Verbose {
+		fmt.Printf("  Analyzing indirect dependencies for: %s\n", projectDir)
+	}
+
+	// 创建带超时的上下文（30秒超时）
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, "go", "list", "-m", "-json", "all")
 	cmd.Dir = projectDir
 
+	// 设置环境变量以避免网络请求
+	cmd.Env = append(os.Environ(), "GOPROXY=direct", "GOSUMDB=off")
+
+	start := time.Now()
 	output, err := cmd.Output()
+	duration := time.Since(start)
+
+	if mc.config.Verbose {
+		fmt.Printf("    go list took: %v\n", duration)
+	}
+
 	if err != nil {
-		if mc.config.Verbose {
-			fmt.Printf("Failed to get indirect dependencies (may not be a valid Go module): %s\n", projectDir)
+		if ctx.Err() == context.DeadlineExceeded {
+			fmt.Printf("⚠️  Warning: Timeout analyzing %s (>30s), skipping indirect dependencies\n", projectDir)
+		} else if mc.config.Verbose {
+			fmt.Printf("    Failed to get indirect dependencies (may not be a valid Go module): %s\n", projectDir)
 		}
 		return nil // Not a fatal error, continue processing other projects
 	}
 
+	// 解析输出
 	decoder := json.NewDecoder(strings.NewReader(string(output)))
+	moduleCount := 0
 	for decoder.More() {
 		var mod struct {
 			Path string `json:"Path"`
@@ -153,7 +239,12 @@ func (mc *ModuleCleaner) analyzeIndirectDependencies(projectDir string) error {
 		}
 		if mod.Path != "" {
 			mc.addUsedModule(mod.Path)
+			moduleCount++
 		}
+	}
+
+	if mc.config.Verbose {
+		fmt.Printf("    Found %d modules\n", moduleCount)
 	}
 
 	return nil
@@ -321,7 +412,7 @@ func (mc *ModuleCleaner) parseDownloadedModulePath(fullPath, downloadDir string)
 	// The structure is typically .../module/path/@v/version.zip
 	// We need to extract the 'module/path' part.
 	dir := filepath.Dir(relativePath)
-	
+
 	// Remove the version part (e.g., @v)
 	if strings.HasSuffix(dir, "@v") {
 		dir = strings.TrimSuffix(dir, "@v")
