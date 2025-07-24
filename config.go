@@ -42,12 +42,12 @@ func NewConfig(modulePaths []string, verbose, dryRun, fastMode bool, maxWorkers,
 
 	// Set default maxWorkers if not specified or invalid
 	if maxWorkers <= 0 {
-		maxWorkers = 8 // Default to 8 workers for better performance
+		maxWorkers = 16 // Default to 16 workers for better performance
 	}
 
 	// Set default timeout if not specified or invalid
 	if timeout <= 0 {
-		timeout = 5 // Default to 5 seconds
+		timeout = 60 // Default to 60 seconds
 	}
 
 	return &Config{
