@@ -48,8 +48,8 @@ func (mc *ModuleCleaner) AnalyzeDependencies() error {
 		fmt.Printf("🔍 Analyzing %d module paths...\n", len(mc.config.ModulePaths))
 	}
 
-	// 使用 worker pool 并发处理项目
-	const maxWorkers = 3 // 限制并发数以避免过度占用系统资源
+	// Use configurable worker pool for concurrent processing
+	maxWorkers := mc.config.MaxWorkers
 	semaphore := make(chan struct{}, maxWorkers)
 	var wg sync.WaitGroup
 	var analysisErrors []error
@@ -58,12 +58,16 @@ func (mc *ModuleCleaner) AnalyzeDependencies() error {
 	totalPaths := len(mc.config.ModulePaths)
 	processed := int32(0)
 
+	if mc.config.Verbose {
+		fmt.Printf("Using %d concurrent workers for analysis\n", maxWorkers)
+	}
+
 	for i, modPath := range mc.config.ModulePaths {
 		wg.Add(1)
 		go func(index int, path string) {
 			defer wg.Done()
-			semaphore <- struct{}{}        // 获取信号量
-			defer func() { <-semaphore }() // 释放信号量
+			semaphore <- struct{}{}        // Acquire semaphore
+			defer func() { <-semaphore }() // Release semaphore
 
 			if mc.config.Verbose {
 				fmt.Printf("[%d/%d] Processing: %s\n", index+1, totalPaths, path)
@@ -75,7 +79,7 @@ func (mc *ModuleCleaner) AnalyzeDependencies() error {
 				errorMutex.Unlock()
 			}
 
-			// 更新进度
+			// Update progress
 			current := atomic.AddInt32(&processed, 1)
 			if mc.config.Verbose {
 				fmt.Printf("✅ [%d/%d] Completed: %s\n", current, totalPaths, path)
@@ -85,7 +89,7 @@ func (mc *ModuleCleaner) AnalyzeDependencies() error {
 
 	wg.Wait()
 
-	// 报告分析结果
+	// Report analysis results
 	if mc.config.Verbose {
 		fmt.Printf("📊 Analysis complete: %d projects processed\n", totalPaths)
 		if len(analysisErrors) > 0 {
@@ -164,7 +168,7 @@ func (mc *ModuleCleaner) analyzeGoModFile(goModPath string) error {
 		}
 	}
 
-	// 在快速模式下跳过间接依赖分析
+	// Skip indirect dependencies analysis in fast mode
 	if mc.config.FastMode {
 		if mc.config.Verbose {
 			fmt.Printf("    Fast mode: skipping indirect dependencies for %s\n", filepath.Dir(goModPath))
@@ -176,9 +180,9 @@ func (mc *ModuleCleaner) analyzeGoModFile(goModPath string) error {
 	return mc.analyzeIndirectDependencies(filepath.Dir(goModPath))
 }
 
-// analyzeIndirectDependencies 分析间接依赖（优化版本）
+// analyzeIndirectDependencies analyzes indirect dependencies (optimized version)
 func (mc *ModuleCleaner) analyzeIndirectDependencies(projectDir string) error {
-	// 添加缓存机制，避免重复分析相同项目
+	// Add caching mechanism to avoid analyzing the same project repeatedly
 	if mc.analyzedProjects == nil {
 		mc.analyzedProjects = make(map[string]bool)
 	}
@@ -200,14 +204,14 @@ func (mc *ModuleCleaner) analyzeIndirectDependencies(projectDir string) error {
 		fmt.Printf("  Analyzing indirect dependencies for: %s\n", projectDir)
 	}
 
-	// 创建带超时的上下文（30秒超时）
+	// Create context with timeout (30 seconds)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, "go", "list", "-m", "-json", "all")
 	cmd.Dir = projectDir
 
-	// 设置环境变量以避免网络请求
+	// Set environment variables to avoid network requests
 	cmd.Env = append(os.Environ(), "GOPROXY=direct", "GOSUMDB=off")
 
 	start := time.Now()
@@ -227,7 +231,7 @@ func (mc *ModuleCleaner) analyzeIndirectDependencies(projectDir string) error {
 		return nil // Not a fatal error, continue processing other projects
 	}
 
-	// 解析输出
+	// Parse output
 	decoder := json.NewDecoder(strings.NewReader(string(output)))
 	moduleCount := 0
 	for decoder.More() {

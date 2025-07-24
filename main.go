@@ -15,6 +15,7 @@ func main() {
 		verbose     = flag.Bool("verbose", false, "Enable verbose output mode")
 		dryRun      = flag.Bool("dry-run", false, "Only simulate run, don't actually delete files")
 		fastMode    = flag.Bool("fast", false, "Fast mode: skip indirect dependencies analysis")
+		maxWorkers  = flag.Int("workers", 8, "Maximum number of concurrent workers (default: 8)")
 		showHelp    = flag.Bool("help", false, "Show help information")
 		showVersion = flag.Bool("version", false, "Show version information")
 	)
@@ -66,7 +67,7 @@ func main() {
 	}
 
 	// Create configuration
-	config, err := NewConfig(paths, *verbose, *dryRun, *fastMode)
+	config, err := NewConfig(paths, *verbose, *dryRun, *fastMode, *maxWorkers)
 	if err != nil {
 		fmt.Printf("❌ Failed to create configuration: %v\n", err)
 		os.Exit(1)
@@ -79,6 +80,7 @@ func main() {
 		fmt.Printf("  - Verbose mode: %t\n", config.Verbose)
 		fmt.Printf("  - Dry run: %t\n", config.DryRun)
 		fmt.Printf("  - Fast mode: %t\n", config.FastMode)
+		fmt.Printf("  - Max workers: %d\n", config.MaxWorkers)
 		fmt.Println()
 	}
 
@@ -157,6 +159,7 @@ Options:
   -verbose           Enable verbose output mode
   -dry-run           Only simulate run, don't actually delete files
   -fast              Fast mode: skip indirect dependencies analysis
+  -workers int       Maximum number of concurrent workers (default: 8)
   -help              Show this help information
   -version           Show version information
 

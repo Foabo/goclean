@@ -16,6 +16,8 @@ type Config struct {
 	GoModCache string
 	// FastMode skip indirect dependencies analysis for faster processing
 	FastMode bool
+	// MaxWorkers maximum number of concurrent workers for dependency analysis
+	MaxWorkers int
 }
 
 // DefaultConfig returns default configuration
@@ -30,10 +32,15 @@ func DefaultConfig() *Config {
 }
 
 // NewConfig creates a new configuration instance
-func NewConfig(modulePaths []string, verbose, dryRun, fastMode bool) (*Config, error) {
+func NewConfig(modulePaths []string, verbose, dryRun, fastMode bool, maxWorkers int) (*Config, error) {
 	gomodcache, err := GetGOMODCACHE()
 	if err != nil {
 		return nil, fmt.Errorf("failed to get GOMODCACHE: %w", err)
+	}
+
+	// Set default maxWorkers if not specified or invalid
+	if maxWorkers <= 0 {
+		maxWorkers = 8 // Default to 8 workers for better performance
 	}
 
 	return &Config{
@@ -41,6 +48,7 @@ func NewConfig(modulePaths []string, verbose, dryRun, fastMode bool) (*Config, e
 		Verbose:     verbose,
 		DryRun:      dryRun,
 		FastMode:    fastMode,
+		MaxWorkers:  maxWorkers,
 		GoModCache:  gomodcache,
 	}, nil
 }
