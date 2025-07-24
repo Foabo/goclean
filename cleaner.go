@@ -34,6 +34,14 @@ type ModuleInfo struct {
 	Type    string // Type: extracted or download
 }
 
+// VCSCacheInfo VCS cache information
+type VCSCacheInfo struct {
+	Hash     string // VCS cache hash
+	RepoURL  string // Repository URL
+	Size     int64  // Size in bytes
+	LastUsed string // Last access time (if available)
+}
+
 // NewModuleCleaner creates new cleaner instance
 func NewModuleCleaner(config *Config) *ModuleCleaner {
 	return &ModuleCleaner{
@@ -493,6 +501,169 @@ func (mc *ModuleCleaner) shouldKeepVersion(modPath, version string) bool {
 	}
 
 	return false
+}
+
+// FindVCSCache finds VCS cache entries
+func (mc *ModuleCleaner) FindVCSCache() ([]VCSCacheInfo, error) {
+	vcsDir := filepath.Join(mc.config.GoModCache, "cache", "vcs")
+
+	// Check if VCS cache directory exists
+	if _, err := os.Stat(vcsDir); os.IsNotExist(err) {
+		if mc.config.Verbose {
+			fmt.Println("📂 No VCS cache directory found")
+		}
+		return []VCSCacheInfo{}, nil
+	}
+
+	if mc.config.Verbose {
+		fmt.Println("🔍 Scanning VCS cache directory...")
+	}
+
+	var vcsCache []VCSCacheInfo
+	var vcsMutex sync.Mutex
+
+	err := filepath.Walk(vcsDir, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return nil // Skip errors
+		}
+
+		// Look for .info files that contain repository information
+		if !info.IsDir() && strings.HasSuffix(info.Name(), ".info") {
+			hash := strings.TrimSuffix(info.Name(), ".info")
+			repoDir := filepath.Join(vcsDir, hash)
+
+			// Check if corresponding repository directory exists
+			if _, err := os.Stat(repoDir); err == nil {
+				size, _ := mc.calculateDirectorySize(repoDir)
+
+				// Try to read repository URL from .info file
+				repoURL := mc.readVCSRepoURL(path)
+
+				// Get last access time
+				lastUsed := info.ModTime().Format("2006-01-02")
+
+				vcsCacheInfo := VCSCacheInfo{
+					Hash:     hash,
+					RepoURL:  repoURL,
+					Size:     size,
+					LastUsed: lastUsed,
+				}
+
+				vcsMutex.Lock()
+				vcsCache = append(vcsCache, vcsCacheInfo)
+				vcsMutex.Unlock()
+			}
+		}
+
+		return nil
+	})
+
+	if mc.config.Verbose {
+		fmt.Printf("📊 Found %d VCS cache entries\n", len(vcsCache))
+	}
+
+	return vcsCache, err
+}
+
+// readVCSRepoURL reads repository URL from VCS .info file
+func (mc *ModuleCleaner) readVCSRepoURL(infoPath string) string {
+	content, err := os.ReadFile(infoPath)
+	if err != nil {
+		return "unknown"
+	}
+
+	// The .info file typically contains the repository URL
+	lines := strings.Split(string(content), "\n")
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "http") || strings.Contains(line, "github.com") {
+			return line
+		}
+	}
+
+	return "unknown"
+}
+
+// RemoveVCSCache removes VCS cache entries
+func (mc *ModuleCleaner) RemoveVCSCache(vcsCache []VCSCacheInfo) error {
+	if mc.config.DryRun {
+		fmt.Println("Dry run mode: The following VCS cache entries would be deleted")
+
+		var totalSizeToDelete int64
+		for _, cache := range vcsCache {
+			fmt.Printf("  - %s (%s) [%s]\n", cache.Hash[:12], FormatSize(cache.Size), cache.RepoURL)
+			totalSizeToDelete += cache.Size
+		}
+
+		fmt.Printf("\n🎯 VCS Cache Dry Run Summary:\n")
+		fmt.Printf("  📦 VCS entries to delete: %d\n", len(vcsCache))
+		fmt.Printf("  🧹 Would free space: %s\n", FormatSize(totalSizeToDelete))
+
+		return nil
+	}
+
+	if mc.config.Verbose {
+		fmt.Printf("Starting to delete %d VCS cache entries...\n", len(vcsCache))
+	}
+
+	// Start timing
+	startTime := time.Now()
+
+	var errors []string
+	deletedCount := 0
+	var totalSizeDeleted int64
+
+	vcsDir := filepath.Join(mc.config.GoModCache, "cache", "vcs")
+
+	for _, cache := range vcsCache {
+		// Remove the repository directory
+		repoDir := filepath.Join(vcsDir, cache.Hash)
+		infoFile := filepath.Join(vcsDir, cache.Hash+".info")
+		lockFile := filepath.Join(vcsDir, cache.Hash+".lock")
+
+		// Remove repository directory
+		if err := os.RemoveAll(repoDir); err != nil {
+			errors = append(errors, fmt.Sprintf("failed to delete VCS repo %s: %v", cache.Hash[:12], err))
+			continue
+		}
+
+		// Remove info file
+		if err := os.Remove(infoFile); err != nil && !os.IsNotExist(err) {
+			if mc.config.Verbose {
+				fmt.Printf("Warning: failed to remove info file %s: %v\n", infoFile, err)
+			}
+		}
+
+		// Remove lock file
+		if err := os.Remove(lockFile); err != nil && !os.IsNotExist(err) {
+			if mc.config.Verbose {
+				fmt.Printf("Warning: failed to remove lock file %s: %v\n", lockFile, err)
+			}
+		}
+
+		deletedCount++
+		totalSizeDeleted += cache.Size
+
+		if mc.config.Verbose {
+			fmt.Printf("Deleted VCS cache: %s (%s) [%s]\n", cache.Hash[:12], FormatSize(cache.Size), cache.RepoURL)
+		}
+	}
+
+	// Calculate elapsed time
+	elapsed := time.Since(startTime)
+
+	// Display statistics
+	fmt.Println("\n🎯 VCS Cache Deletion Summary:")
+	fmt.Printf("  ✅ VCS entries deleted: %d/%d\n", deletedCount, len(vcsCache))
+	fmt.Printf("  ⏱️  Time taken: %v\n", elapsed.Round(time.Millisecond))
+	fmt.Printf("  🧹 Space freed: %s\n", FormatSize(totalSizeDeleted))
+
+	if len(errors) > 0 {
+		fmt.Printf("  ❌ Errors: %d\n", len(errors))
+		return fmt.Errorf("errors occurred during VCS cache deletion:\n%s", strings.Join(errors, "\n"))
+	}
+
+	return nil
 }
 
 // FindUnusedModules finds unused modules with parallel processing
@@ -1022,32 +1193,71 @@ func (mc *ModuleCleaner) makeDirectoryWritable(dirPath string) error {
 
 // ShowInteractiveMenu displays interactive menu
 func (mc *ModuleCleaner) ShowInteractiveMenu(unusedModules []ModuleInfo) error {
-	if len(unusedModules) == 0 {
-		fmt.Println("Great! No unused modules found.")
+	// Also scan for VCS cache
+	vcsCache, err := mc.FindVCSCache()
+	if err != nil {
+		if mc.config.Verbose {
+			fmt.Printf("Warning: failed to scan VCS cache: %v\n", err)
+		}
+		vcsCache = []VCSCacheInfo{} // Continue without VCS cache
+	}
+
+	if len(unusedModules) == 0 && len(vcsCache) == 0 {
+		fmt.Println("Great! No unused modules or VCS cache found.")
 		return nil
 	}
 
-	totalSize := int64(0)
+	totalModuleSize := int64(0)
 	for _, mod := range unusedModules {
-		totalSize += mod.Size
+		totalModuleSize += mod.Size
+	}
+
+	totalVCSSize := int64(0)
+	for _, cache := range vcsCache {
+		totalVCSSize += cache.Size
 	}
 
 	viewedDetails := false
 
 	// Loop until user chooses to exit or delete
 	for {
-		fmt.Printf("Found %d unused modules, occupying %s disk space.\n\n",
-			len(unusedModules), FormatSize(totalSize))
+		fmt.Printf("Cleanup Summary:\n")
+		if len(unusedModules) > 0 {
+			fmt.Printf("  📦 Found %d unused modules, occupying %s disk space\n",
+				len(unusedModules), FormatSize(totalModuleSize))
+		}
+		if len(vcsCache) > 0 {
+			fmt.Printf("  🗂️  Found %d VCS cache entries, occupying %s disk space\n",
+				len(vcsCache), FormatSize(totalVCSSize))
+		}
+		fmt.Printf("  🧹 Total space that can be freed: %s\n\n",
+			FormatSize(totalModuleSize+totalVCSSize))
 
 		fmt.Println("You can:")
+		optionNum := 1
+
 		if !viewedDetails {
-			fmt.Println("(1) View details")
-			fmt.Println("(2) Delete these modules (requires administrator privileges)")
-			fmt.Println("(3) Exit")
-		} else {
-			fmt.Println("(1) Delete these modules (requires administrator privileges)")
-			fmt.Println("(2) Exit")
+			fmt.Printf("(%d) View details\n", optionNum)
+			optionNum++
 		}
+
+		if len(unusedModules) > 0 {
+			fmt.Printf("(%d) Delete unused modules only (%s)\n", optionNum, FormatSize(totalModuleSize))
+			optionNum++
+		}
+
+		if len(vcsCache) > 0 {
+			fmt.Printf("(%d) Delete VCS cache only (%s)\n", optionNum, FormatSize(totalVCSSize))
+			optionNum++
+		}
+
+		if len(unusedModules) > 0 && len(vcsCache) > 0 {
+			fmt.Printf("(%d) Delete both modules and VCS cache (%s)\n", optionNum, FormatSize(totalModuleSize+totalVCSSize))
+			optionNum++
+		}
+
+		fmt.Printf("(%d) Exit\n", optionNum)
+
 		fmt.Print("\nPlease enter the number in parentheses: ")
 
 		reader := bufio.NewReader(os.Stdin)
@@ -1058,38 +1268,63 @@ func (mc *ModuleCleaner) ShowInteractiveMenu(unusedModules []ModuleInfo) error {
 
 		choice = strings.TrimSpace(choice)
 
-		if !viewedDetails {
-			// First time menu with view details option
-			switch choice {
-			case "1":
-				if err := mc.showModuleDetails(unusedModules); err != nil {
-					return err
-				}
-				viewedDetails = true
-				fmt.Println()
-			case "2":
-				return mc.confirmAndRemove(unusedModules)
-			case "3":
-				fmt.Println("Exit.")
-				return nil
-			default:
-				fmt.Println("Invalid choice, please try again.")
-				fmt.Println()
-			}
-		} else {
-			// After viewing details, simplified menu
-			switch choice {
-			case "1":
-				return mc.confirmAndRemove(unusedModules)
-			case "2":
-				fmt.Println("Exit.")
-				return nil
-			default:
-				fmt.Println("Invalid choice, please try again.")
-				fmt.Println()
-			}
-		}
+		return mc.handleMenuChoice(choice, unusedModules, vcsCache, &viewedDetails)
 	}
+}
+
+// handleMenuChoice handles user menu choice
+func (mc *ModuleCleaner) handleMenuChoice(choice string, unusedModules []ModuleInfo, vcsCache []VCSCacheInfo, viewedDetails *bool) error {
+	optionNum := 1
+
+	// View details option
+	if !*viewedDetails {
+		if choice == fmt.Sprintf("%d", optionNum) {
+			if err := mc.showModuleDetails(unusedModules); err != nil {
+				return err
+			}
+			if len(vcsCache) > 0 {
+				mc.showVCSDetails(vcsCache)
+			}
+			*viewedDetails = true
+			fmt.Println()
+			return nil
+		}
+		optionNum++
+	}
+
+	// Delete unused modules only
+	if len(unusedModules) > 0 {
+		if choice == fmt.Sprintf("%d", optionNum) {
+			return mc.confirmAndRemove(unusedModules)
+		}
+		optionNum++
+	}
+
+	// Delete VCS cache only
+	if len(vcsCache) > 0 {
+		if choice == fmt.Sprintf("%d", optionNum) {
+			return mc.confirmAndRemoveVCSCache(vcsCache)
+		}
+		optionNum++
+	}
+
+	// Delete both
+	if len(unusedModules) > 0 && len(vcsCache) > 0 {
+		if choice == fmt.Sprintf("%d", optionNum) {
+			return mc.confirmAndRemoveBoth(unusedModules, vcsCache)
+		}
+		optionNum++
+	}
+
+	// Exit option
+	if choice == fmt.Sprintf("%d", optionNum) {
+		fmt.Println("Exit.")
+		return nil
+	}
+
+	fmt.Println("Invalid choice, please try again.")
+	fmt.Println()
+	return nil
 }
 
 // showModuleDetails displays module detailed information
@@ -1210,4 +1445,96 @@ func (mc *ModuleCleaner) confirmAndRemove(modules []ModuleInfo) error {
 	}
 
 	return mc.RemoveUnusedModules(modules)
+}
+
+// showVCSDetails displays VCS cache detailed information
+func (mc *ModuleCleaner) showVCSDetails(vcsCache []VCSCacheInfo) {
+	if len(vcsCache) == 0 {
+		return
+	}
+
+	fmt.Println("\nVCS Cache detailed information:")
+	fmt.Println(strings.Repeat("-", 80))
+
+	// Sort by size for better display
+	sort.Slice(vcsCache, func(i, j int) bool {
+		return vcsCache[i].Size > vcsCache[j].Size
+	})
+
+	for _, cache := range vcsCache {
+		fmt.Printf("🗂️  Hash: %s\n", cache.Hash[:12])
+		fmt.Printf("   📁 Repository: %s\n", cache.RepoURL)
+		fmt.Printf("   💾 Size: %s\n", FormatSize(cache.Size))
+		fmt.Printf("   📅 Last used: %s\n", cache.LastUsed)
+
+		// Show cache path
+		vcsDir := filepath.Join(mc.config.GoModCache, "cache", "vcs")
+		fmt.Printf("   📁 Cache path: %s/%s\n", vcsDir, cache.Hash[:12])
+		fmt.Println()
+	}
+}
+
+// confirmAndRemoveVCSCache confirms and removes VCS cache
+func (mc *ModuleCleaner) confirmAndRemoveVCSCache(vcsCache []VCSCacheInfo) error {
+	fmt.Printf("\nConfirm deletion of %d VCS cache entries? (y/N): ", len(vcsCache))
+
+	reader := bufio.NewReader(os.Stdin)
+	confirm, err := reader.ReadString('\n')
+	if err != nil {
+		return fmt.Errorf("failed to read confirmation: %w", err)
+	}
+
+	confirm = strings.ToLower(strings.TrimSpace(confirm))
+	if confirm != "y" && confirm != "yes" {
+		fmt.Println("VCS cache deletion cancelled.")
+		return nil
+	}
+
+	return mc.RemoveVCSCache(vcsCache)
+}
+
+// confirmAndRemoveBoth confirms and removes both modules and VCS cache
+func (mc *ModuleCleaner) confirmAndRemoveBoth(modules []ModuleInfo, vcsCache []VCSCacheInfo) error {
+	totalModuleSize := int64(0)
+	for _, mod := range modules {
+		totalModuleSize += mod.Size
+	}
+
+	totalVCSSize := int64(0)
+	for _, cache := range vcsCache {
+		totalVCSSize += cache.Size
+	}
+
+	fmt.Printf("\nConfirm deletion of:\n")
+	fmt.Printf("  - %d unused modules (%s)\n", len(modules), FormatSize(totalModuleSize))
+	fmt.Printf("  - %d VCS cache entries (%s)\n", len(vcsCache), FormatSize(totalVCSSize))
+	fmt.Printf("  - Total space to free: %s\n", FormatSize(totalModuleSize+totalVCSSize))
+	fmt.Printf("\nProceed? (y/N): ")
+
+	reader := bufio.NewReader(os.Stdin)
+	confirm, err := reader.ReadString('\n')
+	if err != nil {
+		return fmt.Errorf("failed to read confirmation: %w", err)
+	}
+
+	confirm = strings.ToLower(strings.TrimSpace(confirm))
+	if confirm != "y" && confirm != "yes" {
+		fmt.Println("Deletion cancelled.")
+		return nil
+	}
+
+	// Remove modules first, then VCS cache
+	if len(modules) > 0 {
+		if err := mc.RemoveUnusedModules(modules); err != nil {
+			return fmt.Errorf("failed to remove modules: %w", err)
+		}
+	}
+
+	if len(vcsCache) > 0 {
+		if err := mc.RemoveVCSCache(vcsCache); err != nil {
+			return fmt.Errorf("failed to remove VCS cache: %w", err)
+		}
+	}
+
+	return nil
 }
