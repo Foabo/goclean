@@ -164,17 +164,20 @@ Options:
   -version           Show version information
 
 Examples:
-  # Use default settings
+  # Use default settings (8 workers)
   goclean
 
-  # Specify directory to scan
-  goclean -modules ~/go
+  # High-performance system (16+ cores)
+  goclean -workers 16 -verbose
 
-  # Enable verbose mode
-  goclean -verbose
+  # Resource-constrained system
+  goclean -workers 4 -fast
 
-  # Dry run (don't actually delete)
-  goclean -dry-run
+  # Enterprise environment with many projects
+  goclean -workers 12 -fast -verbose
+
+  # Dry run to preview (recommended first run)
+  goclean -dry-run -verbose
 
 Notes:
   - Deleting modules may require administrator privileges

@@ -185,9 +185,7 @@ func (mc *ModuleCleaner) analyzeGoModFile(goModPath string) error {
 
 	// Add direct dependencies
 	for _, require := range modFile.Require {
-		if !require.Indirect {
-			mc.addUsedModule(require.Mod.Path)
-		}
+		mc.addUsedModule(require.Mod.Path)
 	}
 
 	// Skip indirect dependencies analysis in fast mode
@@ -198,8 +196,125 @@ func (mc *ModuleCleaner) analyzeGoModFile(goModPath string) error {
 		return nil
 	}
 
-	// Get complete dependency graph (including indirect dependencies)
-	return mc.analyzeIndirectDependencies(filepath.Dir(goModPath))
+	projectDir := filepath.Dir(goModPath)
+
+	// Try alternative methods before falling back to go list
+	if err := mc.analyzeGoSumFile(projectDir); err == nil {
+		if mc.config.Verbose {
+			fmt.Printf("    Successfully analyzed dependencies from go.sum\n")
+		}
+		return nil
+	}
+
+	if err := mc.analyzeVendorDirectory(projectDir); err == nil {
+		if mc.config.Verbose {
+			fmt.Printf("    Successfully analyzed dependencies from vendor directory\n")
+		}
+		return nil
+	}
+
+	// Fallback to go list (which may timeout in enterprise environments)
+	if mc.config.Verbose {
+		fmt.Printf("    Falling back to go list command (may timeout in enterprise environments)\n")
+	}
+	return mc.analyzeIndirectDependencies(projectDir)
+}
+
+// analyzeGoSumFile analyzes go.sum file to extract all used modules
+func (mc *ModuleCleaner) analyzeGoSumFile(projectDir string) error {
+	goSumPath := filepath.Join(projectDir, "go.sum")
+	if !PathExists(goSumPath) {
+		return fmt.Errorf("go.sum not found")
+	}
+
+	if mc.config.Verbose {
+		fmt.Printf("    Analyzing go.sum file: %s\n", goSumPath)
+	}
+
+	content, err := os.ReadFile(goSumPath)
+	if err != nil {
+		return fmt.Errorf("failed to read go.sum: %w", err)
+	}
+
+	moduleCount := 0
+	processedModules := make(map[string]bool)
+
+	lines := strings.Split(string(content), "\n")
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+
+		// go.sum format: module version hash
+		// Example: github.com/gin-gonic/gin v1.9.1 h1:abc123...
+		parts := strings.Fields(line)
+		if len(parts) >= 2 {
+			modulePath := parts[0]
+			if modulePath != "" && !processedModules[modulePath] {
+				mc.addUsedModule(modulePath)
+				processedModules[modulePath] = true
+				moduleCount++
+			}
+		}
+	}
+
+	if mc.config.Verbose {
+		fmt.Printf("    Found %d modules from go.sum\n", moduleCount)
+	}
+
+	return nil
+}
+
+// analyzeVendorDirectory analyzes vendor directory to find used modules
+func (mc *ModuleCleaner) analyzeVendorDirectory(projectDir string) error {
+	vendorPath := filepath.Join(projectDir, "vendor")
+	if !PathExists(vendorPath) {
+		return fmt.Errorf("vendor directory not found")
+	}
+
+	if mc.config.Verbose {
+		fmt.Printf("    Analyzing vendor directory: %s\n", vendorPath)
+	}
+
+	moduleCount := 0
+	err := filepath.Walk(vendorPath, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return nil // Skip errors
+		}
+
+		if info.IsDir() {
+			relPath, err := filepath.Rel(vendorPath, path)
+			if err != nil {
+				return nil
+			}
+
+			// Skip if this is the vendor root or a version directory
+			if relPath == "." || strings.Contains(relPath, "@") {
+				return nil
+			}
+
+			// Check if this looks like a module path
+			if strings.Count(relPath, "/") >= 2 { // e.g., github.com/user/repo
+				// Get the module root (first 3 path segments for github.com style)
+				parts := strings.Split(relPath, "/")
+				if len(parts) >= 3 {
+					modulePath := strings.Join(parts[:3], "/")
+					mc.addUsedModule(modulePath)
+					moduleCount++
+					return filepath.SkipDir // Don't descend into this module
+				}
+			}
+		}
+
+		return nil
+	})
+
+	if mc.config.Verbose {
+		fmt.Printf("    Found %d modules from vendor directory\n", moduleCount)
+	}
+
+	return err
 }
 
 // analyzeIndirectDependencies analyzes indirect dependencies (optimized version)
@@ -328,40 +443,135 @@ func (mc *ModuleCleaner) isModuleUsed(modPath string) bool {
 	return mc.usedModules[modPath]
 }
 
-// FindUnusedModules finds unused modules
+// FindUnusedModules finds unused modules with parallel processing
 func (mc *ModuleCleaner) FindUnusedModules() ([]ModuleInfo, error) {
 	if mc.config.Verbose {
 		fmt.Println("Scanning module cache directory...")
 	}
 
+	// Use channels to collect results from parallel goroutines
+	extractedChan := make(chan []ModuleInfo, 1)
+	downloadedChan := make(chan []ModuleInfo, 1)
+	errorChan := make(chan error, 2)
+
+	// Start parallel scanning
+	var wg sync.WaitGroup
+
+	// Scan extracted modules in parallel
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		if mc.config.Verbose {
+			fmt.Println("  Scanning extracted modules...")
+		}
+		extractedModules, err := mc.findUnusedExtractedModules()
+		if err != nil {
+			errorChan <- fmt.Errorf("failed to scan extracted modules: %w", err)
+			return
+		}
+		extractedChan <- extractedModules
+		if mc.config.Verbose {
+			fmt.Printf("  Found %d unused extracted modules\n", len(extractedModules))
+		}
+	}()
+
+	// Scan downloaded modules in parallel
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		if mc.config.Verbose {
+			fmt.Println("  Scanning downloaded modules...")
+		}
+		downloadedModules, err := mc.findUnusedDownloadedModules()
+		if err != nil {
+			errorChan <- fmt.Errorf("failed to scan downloaded modules: %w", err)
+			return
+		}
+		downloadedChan <- downloadedModules
+		if mc.config.Verbose {
+			fmt.Printf("  Found %d unused downloaded modules\n", len(downloadedModules))
+		}
+	}()
+
+	// Wait for completion
+	wg.Wait()
+	close(errorChan)
+	close(extractedChan)
+	close(downloadedChan)
+
+	// Check for errors
+	for err := range errorChan {
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	// Combine results
 	var unusedModules []ModuleInfo
 
-	// Scan extracted modules
-	extractedModules, err := mc.findUnusedExtractedModules()
-	if err != nil {
-		return nil, fmt.Errorf("failed to scan extracted modules: %w", err)
+	// Get extracted modules results
+	if extractedModules := <-extractedChan; extractedModules != nil {
+		unusedModules = append(unusedModules, extractedModules...)
 	}
-	unusedModules = append(unusedModules, extractedModules...)
 
-	// Scan downloaded modules
-	downloadedModules, err := mc.findUnusedDownloadedModules()
-	if err != nil {
-		return nil, fmt.Errorf("failed to scan downloaded modules: %w", err)
+	// Get downloaded modules results
+	if downloadedModules := <-downloadedChan; downloadedModules != nil {
+		unusedModules = append(unusedModules, downloadedModules...)
 	}
-	unusedModules = append(unusedModules, downloadedModules...)
 
-	// Sort by module path
+	// Sort by module path for consistent output
 	sort.Slice(unusedModules, func(i, j int) bool {
 		return unusedModules[i].Path < unusedModules[j].Path
 	})
 
+	if mc.config.Verbose {
+		fmt.Printf("📊 Total unused modules found: %d\n", len(unusedModules))
+	}
+
 	return unusedModules, nil
 }
 
-// findUnusedExtractedModules finds unused extracted modules
+// findUnusedExtractedModules finds unused extracted modules with concurrent size calculation
 func (mc *ModuleCleaner) findUnusedExtractedModules() ([]ModuleInfo, error) {
+	var modulesMutex sync.Mutex
 	var modules []ModuleInfo
 	cacheDir := mc.config.GoModCache
+
+	// Channel to control concurrent size calculations
+	sizeChan := make(chan ModuleInfo, 100) // Buffer for better performance
+	var sizeWg sync.WaitGroup
+
+	// Use configurable worker count, default to MaxWorkers for consistency
+	sizeWorkers := mc.config.MaxWorkers
+	if sizeWorkers > 10 {
+		sizeWorkers = 10 // Cap at 10 for size calculations to avoid too much I/O contention
+	}
+
+	if mc.config.Verbose {
+		fmt.Printf("    Using %d workers for size calculations\n", sizeWorkers)
+	}
+
+	// Worker pool for size calculations
+	for i := 0; i < sizeWorkers; i++ {
+		sizeWg.Add(1)
+		go func() {
+			defer sizeWg.Done()
+			for moduleInfo := range sizeChan {
+				// Calculate directory size
+				size, _ := mc.calculateDirectorySize(moduleInfo.Path) // Path contains full directory path temporarily
+
+				// Update the module info with calculated size and correct path
+				modulesMutex.Lock()
+				for i := range modules {
+					if modules[i].Path == moduleInfo.Path { // Using full path as identifier temporarily
+						modules[i].Size = size
+						break
+					}
+				}
+				modulesMutex.Unlock()
+			}
+		}()
+	}
 
 	err := filepath.Walk(cacheDir, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
@@ -380,13 +590,21 @@ func (mc *ModuleCleaner) findUnusedExtractedModules() ([]ModuleInfo, error) {
 			// This is a versioned module directory, e.g., github.com/gin-gonic/gin@v1.9.1
 			modPath, version := mc.parseExtractedModulePath(path, cacheDir)
 			if modPath != "" && !mc.isModuleUsed(modPath) {
-				size, _ := mc.calculateDirectorySize(path)
-				modules = append(modules, ModuleInfo{
-					Path:    modPath,
+				// Add module to list first (with placeholder size)
+				moduleInfo := ModuleInfo{
+					Path:    path, // Temporarily store full path for worker identification
 					Version: version,
-					Size:    size,
+					Size:    0, // Will be calculated by workers
 					Type:    "extracted",
-				})
+				}
+
+				modulesMutex.Lock()
+				modules = append(modules, moduleInfo)
+				modulesMutex.Unlock()
+
+				// Send to size calculation workers
+				sizeChan <- moduleInfo
+
 				return filepath.SkipDir // Skip subdirectories
 			}
 		}
@@ -394,16 +612,67 @@ func (mc *ModuleCleaner) findUnusedExtractedModules() ([]ModuleInfo, error) {
 		return nil
 	})
 
+	// Close the channel and wait for all size calculations to complete
+	close(sizeChan)
+	sizeWg.Wait()
+
+	// Fix the Path field to contain module path instead of full directory path
+	modulesMutex.Lock()
+	for i := range modules {
+		modPath, _ := mc.parseExtractedModulePath(modules[i].Path, cacheDir)
+		modules[i].Path = modPath
+	}
+	modulesMutex.Unlock()
+
 	return modules, err
 }
 
-// findUnusedDownloadedModules finds unused downloaded modules
+// findUnusedDownloadedModules finds unused downloaded modules with concurrent processing
 func (mc *ModuleCleaner) findUnusedDownloadedModules() ([]ModuleInfo, error) {
+	var modulesMutex sync.Mutex
 	var modules []ModuleInfo
 	downloadDir := filepath.Join(mc.config.GoModCache, "cache", "download")
 
 	if _, err := os.Stat(downloadDir); os.IsNotExist(err) {
 		return modules, nil
+	}
+
+	// Use map to track processed modules and avoid duplicates
+	processedModules := make(map[string]*ModuleInfo) // key: modPath@version
+
+	// Channel for concurrent size calculations
+	sizeChan := make(chan string, 100) // Send module key for size calculation
+	var sizeWg sync.WaitGroup
+
+	// Use configurable worker count, but cap it for download size calculations
+	sizeWorkers := mc.config.MaxWorkers / 2 // Use half of MaxWorkers for download calculations
+	if sizeWorkers < 2 {
+		sizeWorkers = 2 // Minimum 2 workers
+	}
+	if sizeWorkers > 6 {
+		sizeWorkers = 6 // Cap at 6 for download calculations (less I/O intensive)
+	}
+
+	if mc.config.Verbose {
+		fmt.Printf("    Using %d workers for download size calculations\n", sizeWorkers)
+	}
+
+	// Worker pool for size calculations
+	for i := 0; i < sizeWorkers; i++ {
+		sizeWg.Add(1)
+		go func() {
+			defer sizeWg.Done()
+			for moduleKey := range sizeChan {
+				modulesMutex.Lock()
+				if moduleInfo, exists := processedModules[moduleKey]; exists {
+					// Calculate size for this module
+					modPath := moduleInfo.Path
+					size := mc.calculateModuleDownloadSize("", downloadDir, modPath)
+					moduleInfo.Size = size
+				}
+				modulesMutex.Unlock()
+			}
+		}()
 	}
 
 	err := filepath.Walk(downloadDir, func(path string, info os.FileInfo, err error) error {
@@ -417,29 +686,40 @@ func (mc *ModuleCleaner) findUnusedDownloadedModules() ([]ModuleInfo, error) {
 
 			modPath := mc.parseDownloadedModulePath(path, downloadDir)
 			if modPath != "" && !mc.isModuleUsed(modPath) {
-				// Only add once, avoid duplication (.mod, .zip, .info all correspond to same module)
-				exists := false
-				for _, mod := range modules {
-					if mod.Path == modPath {
-						exists = true
-						break
-					}
-				}
+				version := mc.extractVersionFromPath(path)
+				moduleKey := modPath + "@" + version
 
-				if !exists {
-					size := mc.calculateModuleDownloadSize(path, downloadDir, modPath)
-					modules = append(modules, ModuleInfo{
+				modulesMutex.Lock()
+				// Only add if not already processed
+				if _, exists := processedModules[moduleKey]; !exists {
+					moduleInfo := &ModuleInfo{
 						Path:    modPath,
-						Version: mc.extractVersionFromPath(path),
-						Size:    size,
+						Version: version,
+						Size:    0, // Will be calculated by workers
 						Type:    "download",
-					})
+					}
+					processedModules[moduleKey] = moduleInfo
+
+					// Send for size calculation
+					sizeChan <- moduleKey
 				}
+				modulesMutex.Unlock()
 			}
 		}
 
 		return nil
 	})
+
+	// Close channel and wait for size calculations
+	close(sizeChan)
+	sizeWg.Wait()
+
+	// Convert map to slice
+	modulesMutex.Lock()
+	for _, moduleInfo := range processedModules {
+		modules = append(modules, *moduleInfo)
+	}
+	modulesMutex.Unlock()
 
 	return modules, err
 }
