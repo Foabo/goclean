@@ -4,8 +4,6 @@ import (
 	"flag"
 	"fmt"
 	"os"
-	"path/filepath"
-	"strings"
 )
 
 func main() {
@@ -14,6 +12,9 @@ func main() {
 		modulePaths = flag.String("modules", "", "Module paths to scan, comma-separated")
 		verbose     = flag.Bool("verbose", false, "Enable verbose output mode")
 		dryRun      = flag.Bool("dry-run", false, "Only simulate run, don't actually delete files")
+		fastMode    = flag.Bool("fast", false, "Fast mode: skip indirect dependencies analysis")
+		maxWorkers  = flag.Int("workers", 16, "Maximum number of concurrent workers (default: 16)")
+		timeout     = flag.Int("timeout", 60, "Timeout for go list commands in seconds (default: 60)")
 		showHelp    = flag.Bool("help", false, "Show help information")
 		showVersion = flag.Bool("version", false, "Show version information")
 	)
@@ -26,7 +27,7 @@ func main() {
 	}
 
 	if *showVersion {
-		fmt.Println("goclean v1.0.0") // Updated version
+		fmt.Println("goclean v1.1.0")
 		fmt.Println("Go Module Cache Intelligent Cleaner")
 		return
 	}
@@ -58,14 +59,24 @@ func main() {
 		}
 		fmt.Println() // Add a newline for better readability
 	} else {
-		rawPaths := strings.Split(*modulePaths, ",")
-		for _, path := range rawPaths {
-			paths = append(paths, strings.TrimSpace(path))
+		expandedPaths, err := ParseModulePaths(*modulePaths)
+		if err != nil {
+			fmt.Printf("❌ Error parsing module paths: %v\n", err)
+			os.Exit(1)
+		}
+		paths = expandedPaths
+
+		if *verbose && len(paths) > 0 {
+			fmt.Printf("📂 Expanded module paths:\n")
+			for i, path := range paths {
+				fmt.Printf("   [%d] %s\n", i+1, path)
+			}
+			fmt.Println()
 		}
 	}
 
 	// Create configuration
-	config, err := NewConfig(paths, *verbose, *dryRun)
+	config, err := NewConfig(paths, *verbose, *dryRun, *fastMode, *maxWorkers, *timeout)
 	if err != nil {
 		fmt.Printf("❌ Failed to create configuration: %v\n", err)
 		os.Exit(1)
@@ -77,6 +88,9 @@ func main() {
 		fmt.Printf("  - Scan paths: %v\n", config.ModulePaths)
 		fmt.Printf("  - Verbose mode: %t\n", config.Verbose)
 		fmt.Printf("  - Dry run: %t\n", config.DryRun)
+		fmt.Printf("  - Fast mode: %t\n", config.FastMode)
+		fmt.Printf("  - Max workers: %d\n", config.MaxWorkers)
+		fmt.Printf("  - Timeout: %ds\n", config.Timeout)
 		fmt.Println()
 	}
 
@@ -108,36 +122,6 @@ func runCleaner(cleaner *ModuleCleaner) error {
 	return cleaner.ShowInteractiveMenu(unusedModules)
 }
 
-// getDefaultModulePath gets default module scan path
-func getDefaultModulePath() (string, error) {
-	// Try using $GOPATH/src
-	gopath, err := GetGOPATH()
-	if err == nil {
-		srcPath := filepath.Join(gopath, "src")
-		if PathExists(srcPath) {
-			return srcPath, nil
-		}
-	}
-
-	// If GOPATH/src doesn't exist, use common directories under user home
-	homeDir, err := os.UserHomeDir()
-	if err != nil {
-		return "", fmt.Errorf("failed to get user home directory: %w", err)
-	}
-
-	// Check common project directories
-	commonDirs := []string{"go", "code", "projects", "workspace", "dev"}
-	for _, dir := range commonDirs {
-		path := filepath.Join(homeDir, dir)
-		if PathExists(path) {
-			return path, nil
-		}
-	}
-
-	// Finally use user home directory
-	return homeDir, nil
-}
-
 // showUsage displays usage instructions
 func showUsage() {
 	fmt.Print(`goclean - Go Module Cache Intelligent Cleaner
@@ -154,25 +138,48 @@ Options:
   -modules string    Module paths to scan, comma-separated
   -verbose           Enable verbose output mode
   -dry-run           Only simulate run, don't actually delete files
+  -fast              Fast mode: skip indirect dependencies analysis
+  -workers int       Maximum number of concurrent workers (default: 8)
+  -timeout int       Timeout for go list commands in seconds (default: 5)
   -help              Show this help information
   -version           Show version information
 
 Examples:
-  # Use default settings
+  # Use default settings (smart project discovery)
   goclean
 
-  # Specify directory to scan
-  goclean -modules ~/go
+  # High-performance system (16+ cores)
+  goclean -workers 16 -verbose
 
-  # Enable verbose mode
-  goclean -verbose
+  # Resource-constrained system
+  goclean -workers 4 -fast
 
-  # Dry run (don't actually delete)
-  goclean -dry-run
+  # Enterprise environment (recommended)
+  goclean -fast -workers 12 -verbose
+
+  # Custom timeout for slow networks
+  goclean -timeout 10 -verbose
+
+  # Very aggressive timeout for enterprise
+  goclean -timeout 2 -fast -verbose
+
+  # Dry run to preview (recommended first run)
+  goclean -dry-run -verbose
+
+  # Specify module paths (supports various formats):
+  goclean -modules .                                    # Current directory
+  goclean -modules ./myproject                          # Relative path
+  goclean -modules ~/go/src/myproject                   # Home directory
+  goclean -modules $GOPATH/src/company.com/project      # Environment variables
+  goclean -modules /absolute/path/to/project            # Absolute path
+  goclean -modules ".,~/other-project,$GOPATH/src/old"  # Multiple paths (comma-separated)
 
 Notes:
   - Deleting modules may require administrator privileges
   - Recommend using -dry-run parameter first to preview content
-  - Default scan directory is $GOPATH/src
+  - Enterprise environments: Use -fast mode to avoid network timeouts
+  - Use -timeout 2 for very restrictive networks
+  - Use -timeout 10 for slow but working networks
+  - Default behavior: auto-discover projects in ~/go and $GOPATH/src
 `)
 }

@@ -216,6 +216,119 @@ func ExpandHomePath(path string) (string, error) {
 	return filepath.Join(homeDir, path[2:]), nil
 }
 
+// ExpandPath expands various path formats including ~, ., $ENV_VAR, and relative paths
+func ExpandPath(path string) (string, error) {
+	if path == "" {
+		return "", fmt.Errorf("empty path")
+	}
+
+	// Handle current directory
+	if path == "." {
+		wd, err := os.Getwd()
+		if err != nil {
+			return "", fmt.Errorf("failed to get current working directory: %w", err)
+		}
+		return wd, nil
+	}
+
+	// Handle relative paths starting with "./"
+	if strings.HasPrefix(path, "./") {
+		wd, err := os.Getwd()
+		if err != nil {
+			return "", fmt.Errorf("failed to get current working directory: %w", err)
+		}
+		return filepath.Join(wd, path[2:]), nil
+	}
+
+	// Handle home directory paths
+	if strings.HasPrefix(path, "~") {
+		return ExpandHomePath(path)
+	}
+
+	// Handle environment variable expansion
+	if strings.Contains(path, "$") {
+		return expandEnvVariables(path)
+	}
+
+	// Handle absolute paths and other cases
+	if filepath.IsAbs(path) {
+		return path, nil
+	}
+
+	// Convert relative path to absolute
+	absPath, err := filepath.Abs(path)
+	if err != nil {
+		return "", fmt.Errorf("failed to get absolute path for %s: %w", path, err)
+	}
+	return absPath, nil
+}
+
+// expandEnvVariables expands environment variables in path
+func expandEnvVariables(path string) (string, error) {
+	// Common Go environment variables that users might use
+	envMap := map[string]func() (string, error){
+		"$GOPATH":     GetGOPATH,
+		"$GOMODCACHE": GetGOMODCACHE,
+		"$HOME": func() (string, error) {
+			return os.UserHomeDir()
+		},
+		"$PWD": func() (string, error) {
+			return os.Getwd()
+		},
+	}
+
+	// Replace known environment variables
+	expandedPath := path
+	for envVar, getFunc := range envMap {
+		if strings.Contains(expandedPath, envVar) {
+			value, err := getFunc()
+			if err != nil {
+				return "", fmt.Errorf("failed to get %s: %w", envVar, err)
+			}
+			expandedPath = strings.ReplaceAll(expandedPath, envVar, value)
+		}
+	}
+
+	// Handle other environment variables like $VAR_NAME
+	expandedPath = os.ExpandEnv(expandedPath)
+
+	return expandedPath, nil
+}
+
+// ParseModulePaths parses and expands a comma-separated list of module paths
+func ParseModulePaths(modulePathsStr string) ([]string, error) {
+	if modulePathsStr == "" {
+		return []string{}, nil
+	}
+
+	rawPaths := strings.Split(modulePathsStr, ",")
+	var expandedPaths []string
+
+	for _, rawPath := range rawPaths {
+		trimmedPath := strings.TrimSpace(rawPath)
+		if trimmedPath == "" {
+			continue
+		}
+
+		expandedPath, err := ExpandPath(trimmedPath)
+		if err != nil {
+			return nil, fmt.Errorf("failed to expand path '%s': %w", trimmedPath, err)
+		}
+
+		// Verify the path exists
+		if _, err := os.Stat(expandedPath); err != nil {
+			if os.IsNotExist(err) {
+				return nil, fmt.Errorf("path does not exist: %s (expanded from %s)", expandedPath, trimmedPath)
+			}
+			return nil, fmt.Errorf("cannot access path %s: %w", expandedPath, err)
+		}
+
+		expandedPaths = append(expandedPaths, expandedPath)
+	}
+
+	return expandedPaths, nil
+}
+
 // CalculateCacheSize calculates total size of Go module cache
 func CalculateCacheSize(cacheDir string) (int64, error) {
 	var totalSize int64
