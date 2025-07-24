@@ -222,7 +222,7 @@ func (mc *ModuleCleaner) analyzeGoModFile(goModPath string) error {
 func (mc *ModuleCleaner) analyzeGoSumFile(projectDir string) error {
 	goSumPath := filepath.Join(projectDir, "go.sum")
 	if !PathExists(goSumPath) {
-		return fmt.Errorf("go.sum not found") // Still return error, but don't log
+		return nil // File doesn't exist, but this is not an error condition
 	}
 
 	if mc.config.Verbose {
@@ -267,18 +267,14 @@ func (mc *ModuleCleaner) analyzeGoSumFile(projectDir string) error {
 		fmt.Printf("    Found %d unique modules from go.sum\n", moduleCount)
 	}
 
-	if moduleCount == 0 {
-		return fmt.Errorf("no modules found in go.sum")
-	}
-
-	return nil
+	return nil // Always return success, even if no modules found
 }
 
 // analyzeVendorDirectory analyzes vendor directory to find used modules
 func (mc *ModuleCleaner) analyzeVendorDirectory(projectDir string) error {
 	vendorPath := filepath.Join(projectDir, "vendor")
 	if !PathExists(vendorPath) {
-		return fmt.Errorf("vendor directory not found") // Still return error, but don't log
+		return nil // Directory doesn't exist, but this is not an error condition
 	}
 
 	if mc.config.Verbose {
@@ -322,7 +318,7 @@ func (mc *ModuleCleaner) analyzeVendorDirectory(projectDir string) error {
 		fmt.Printf("    Found %d modules from vendor directory\n", moduleCount)
 	}
 
-	return err
+	return err // Return the walk error if any, but missing directory is not an error
 }
 
 // analyzeIndirectDependencies analyzes indirect dependencies (optimized version)
