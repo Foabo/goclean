@@ -1453,15 +1453,15 @@ func (mc *ModuleCleaner) ShowInteractiveMenu(unusedModules []ModuleInfo) error {
 
 		err = mc.handleMenuChoice(choice, unusedModules, vcsCache, &viewedDetails)
 		if err != nil {
-			return err
+			// Check if it's a continue signal
+			if _, isContinue := err.(continueMenuError); isContinue {
+				continue // Continue the menu loop
+			}
+			return err // Return actual errors
 		}
 
-		// Check if user chose to exit or perform deletion
-		if mc.shouldExitMenu(choice, unusedModules, vcsCache, viewedDetails) {
-			return nil
-		}
-
-		// Continue the loop for other choices like viewing details
+		// If we reach here, it means user chose exit or deletion (both should exit)
+		return nil
 	}
 }
 
@@ -1480,7 +1480,7 @@ func (mc *ModuleCleaner) handleMenuChoice(choice string, unusedModules []ModuleI
 			}
 			*viewedDetails = true
 			fmt.Println()
-			return nil
+			return continueMenuError{}
 		}
 		optionNum++
 	}
@@ -1732,18 +1732,9 @@ func (mc *ModuleCleaner) confirmAndRemoveBoth(modules []ModuleInfo, vcsCache []V
 	return nil
 }
 
-// shouldExitMenu checks if the user chose an option that should exit the menu
-func (mc *ModuleCleaner) shouldExitMenu(choice string, unusedModules []ModuleInfo, vcsCache []VCSCacheInfo, viewedDetails bool) bool {
-	optionNum := 1
+// continueMenuError is a special error type to indicate menu should continue
+type continueMenuError struct{}
 
-	// Skip view details option if already viewed
-	if !viewedDetails {
-		if choice == fmt.Sprintf("%d", optionNum) {
-			return false // View details should not exit
-		}
-		optionNum++
-	}
-
-	// All other options (delete, exit) should exit the menu
-	return true
+func (e continueMenuError) Error() string {
+	return "continue menu"
 }
