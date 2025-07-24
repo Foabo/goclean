@@ -37,8 +37,9 @@ type ModuleInfo struct {
 // NewModuleCleaner creates new cleaner instance
 func NewModuleCleaner(config *Config) *ModuleCleaner {
 	return &ModuleCleaner{
-		config:      config,
-		usedModules: make(map[string]bool),
+		config:           config,
+		usedModules:      make(map[string]bool),
+		analyzedProjects: make(map[string]bool), // Initialize here to avoid race condition
 	}
 }
 
@@ -323,23 +324,22 @@ func (mc *ModuleCleaner) analyzeVendorDirectory(projectDir string) error {
 
 // analyzeIndirectDependencies analyzes indirect dependencies (optimized version)
 func (mc *ModuleCleaner) analyzeIndirectDependencies(projectDir string) error {
-	// Add caching mechanism to avoid analyzing the same project repeatedly
-	if mc.analyzedProjects == nil {
-		mc.analyzedProjects = make(map[string]bool)
-	}
-
 	absProjectDir, err := filepath.Abs(projectDir)
 	if err != nil {
 		absProjectDir = projectDir
 	}
 
+	// Protect analyzedProjects map access with mutex
+	mc.mutex.Lock()
 	if mc.analyzedProjects[absProjectDir] {
+		mc.mutex.Unlock()
 		if mc.config.Verbose {
 			fmt.Printf("  Skipping already analyzed project: %s\n", projectDir)
 		}
 		return nil
 	}
 	mc.analyzedProjects[absProjectDir] = true
+	mc.mutex.Unlock()
 
 	if mc.config.Verbose {
 		fmt.Printf("  Analyzing indirect dependencies for: %s\n", projectDir)
