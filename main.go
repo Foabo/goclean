@@ -16,6 +16,7 @@ func main() {
 		dryRun      = flag.Bool("dry-run", false, "Only simulate run, don't actually delete files")
 		fastMode    = flag.Bool("fast", false, "Fast mode: skip indirect dependencies analysis")
 		maxWorkers  = flag.Int("workers", 8, "Maximum number of concurrent workers (default: 8)")
+		timeout     = flag.Int("timeout", 5, "Timeout for go list commands in seconds (default: 5)")
 		showHelp    = flag.Bool("help", false, "Show help information")
 		showVersion = flag.Bool("version", false, "Show version information")
 	)
@@ -67,7 +68,7 @@ func main() {
 	}
 
 	// Create configuration
-	config, err := NewConfig(paths, *verbose, *dryRun, *fastMode, *maxWorkers)
+	config, err := NewConfig(paths, *verbose, *dryRun, *fastMode, *maxWorkers, *timeout)
 	if err != nil {
 		fmt.Printf("❌ Failed to create configuration: %v\n", err)
 		os.Exit(1)
@@ -81,6 +82,7 @@ func main() {
 		fmt.Printf("  - Dry run: %t\n", config.DryRun)
 		fmt.Printf("  - Fast mode: %t\n", config.FastMode)
 		fmt.Printf("  - Max workers: %d\n", config.MaxWorkers)
+		fmt.Printf("  - Timeout: %ds\n", config.Timeout)
 		fmt.Println()
 	}
 
@@ -160,11 +162,12 @@ Options:
   -dry-run           Only simulate run, don't actually delete files
   -fast              Fast mode: skip indirect dependencies analysis
   -workers int       Maximum number of concurrent workers (default: 8)
+  -timeout int       Timeout for go list commands in seconds (default: 5)
   -help              Show this help information
   -version           Show version information
 
 Examples:
-  # Use default settings (8 workers)
+  # Use default settings (8 workers, 5s timeout)
   goclean
 
   # High-performance system (16+ cores)
@@ -173,8 +176,14 @@ Examples:
   # Resource-constrained system
   goclean -workers 4 -fast
 
-  # Enterprise environment with many projects
-  goclean -workers 12 -fast -verbose
+  # Enterprise environment (recommended)
+  goclean -fast -workers 12 -verbose
+
+  # Custom timeout for slow networks
+  goclean -timeout 10 -verbose
+
+  # Very aggressive timeout for enterprise
+  goclean -timeout 2 -fast -verbose
 
   # Dry run to preview (recommended first run)
   goclean -dry-run -verbose
@@ -182,6 +191,9 @@ Examples:
 Notes:
   - Deleting modules may require administrator privileges
   - Recommend using -dry-run parameter first to preview content
-  - Default scan directory is $GOPATH/src
+  - Enterprise environments: Use -fast mode to avoid network timeouts
+  - Use -timeout 2 for very restrictive networks
+  - Use -timeout 10 for slow but working networks
+  - Default behavior: auto-discover projects in ~/go and $GOPATH/src
 `)
 }

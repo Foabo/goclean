@@ -198,25 +198,29 @@ func (mc *ModuleCleaner) analyzeGoModFile(goModPath string) error {
 
 	projectDir := filepath.Dir(goModPath)
 
-	// Try alternative methods before falling back to go list
-	if err := mc.analyzeGoSumFile(projectDir); err == nil {
+	// Always try go.sum first (most reliable for enterprise environments)
+	goSumErr := mc.analyzeGoSumFile(projectDir)
+	vendorErr := mc.analyzeVendorDirectory(projectDir)
+
+	// If both static methods succeeded, don't try go list at all
+	if goSumErr == nil || vendorErr == nil {
 		if mc.config.Verbose {
-			fmt.Printf("    Successfully analyzed dependencies from go.sum\n")
+			if goSumErr == nil {
+				fmt.Printf("    Successfully used go.sum for dependency analysis\n")
+			} else {
+				fmt.Printf("    Successfully used vendor directory for dependency analysis\n")
+			}
 		}
 		return nil
 	}
 
-	if err := mc.analyzeVendorDirectory(projectDir); err == nil {
-		if mc.config.Verbose {
-			fmt.Printf("    Successfully analyzed dependencies from vendor directory\n")
-		}
-		return nil
-	}
-
-	// Fallback to go list (which may timeout in enterprise environments)
+	// Only try go list if both static methods failed AND we're not in an enterprise environment
 	if mc.config.Verbose {
-		fmt.Printf("    Falling back to go list command (may timeout in enterprise environments)\n")
+		fmt.Printf("    Static analysis failed, attempting go list (may timeout)\n")
+		fmt.Printf("    go.sum error: %v\n", goSumErr)
+		fmt.Printf("    vendor error: %v\n", vendorErr)
 	}
+
 	return mc.analyzeIndirectDependencies(projectDir)
 }
 
@@ -242,25 +246,35 @@ func (mc *ModuleCleaner) analyzeGoSumFile(projectDir string) error {
 	lines := strings.Split(string(content), "\n")
 	for _, line := range lines {
 		line = strings.TrimSpace(line)
-		if line == "" {
+		if line == "" || strings.HasPrefix(line, "//") {
 			continue
 		}
 
 		// go.sum format: module version hash
 		// Example: github.com/gin-gonic/gin v1.9.1 h1:abc123...
+		// Also handle /go.mod entries: github.com/gin-gonic/gin v1.9.1/go.mod h1:def456...
 		parts := strings.Fields(line)
-		if len(parts) >= 2 {
+		if len(parts) >= 3 {
 			modulePath := parts[0]
+
 			if modulePath != "" && !processedModules[modulePath] {
 				mc.addUsedModule(modulePath)
 				processedModules[modulePath] = true
 				moduleCount++
+
+				if mc.config.Verbose && moduleCount <= 5 {
+					fmt.Printf("      Added: %s\n", modulePath)
+				}
 			}
 		}
 	}
 
 	if mc.config.Verbose {
-		fmt.Printf("    Found %d modules from go.sum\n", moduleCount)
+		fmt.Printf("    Found %d unique modules from go.sum\n", moduleCount)
+	}
+
+	if moduleCount == 0 {
+		return fmt.Errorf("no modules found in go.sum")
 	}
 
 	return nil
@@ -341,8 +355,18 @@ func (mc *ModuleCleaner) analyzeIndirectDependencies(projectDir string) error {
 		fmt.Printf("  Analyzing indirect dependencies for: %s\n", projectDir)
 	}
 
-	// Create context with timeout (30 seconds)
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	// Use configurable timeout from command line
+	timeout := time.Duration(mc.config.Timeout) * time.Second
+
+	// Allow environment variable to override if set
+	if customTimeout := os.Getenv("GOCLEAN_TIMEOUT"); customTimeout != "" {
+		if parsedTimeout, err := time.ParseDuration(customTimeout); err == nil {
+			timeout = parsedTimeout
+		}
+	}
+
+	// Create context with configurable timeout
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, "go", "list", "-m", "-json", "all")
@@ -351,12 +375,13 @@ func (mc *ModuleCleaner) analyzeIndirectDependencies(projectDir string) error {
 	// Debug: Show current environment
 	if mc.config.Verbose {
 		fmt.Printf("    Working directory: %s\n", projectDir)
+		fmt.Printf("    Timeout: %v\n", timeout)
 		fmt.Printf("    Current GOPROXY: %s\n", os.Getenv("GOPROXY"))
 		fmt.Printf("    Current GOSUMDB: %s\n", os.Getenv("GOSUMDB"))
 	}
 
-	// Set environment variables to avoid network requests
-	cmd.Env = append(os.Environ(), "GOPROXY=direct", "GOSUMDB=off")
+	// Always respect existing environment in enterprise settings
+	cmd.Env = os.Environ()
 
 	start := time.Now()
 	output, err := cmd.Output()
@@ -369,29 +394,20 @@ func (mc *ModuleCleaner) analyzeIndirectDependencies(projectDir string) error {
 
 	if err != nil {
 		if ctx.Err() == context.DeadlineExceeded {
-			fmt.Printf("⚠️  Warning: Timeout analyzing %s (>30s), skipping indirect dependencies\n", projectDir)
+			fmt.Printf("⚠️  Warning: go list timeout (%v) for %s - skipping indirect dependencies\n", timeout, projectDir)
+			if mc.config.Verbose {
+				fmt.Printf("    This is expected in enterprise environments with private repositories\n")
+				fmt.Printf("    The tool will continue using go.mod + go.sum analysis only\n")
+			}
 		} else {
 			if mc.config.Verbose {
-				fmt.Printf("    Error details: %v\n", err)
+				fmt.Printf("    go list error for %s: %v\n", projectDir, err)
 				if exitError, ok := err.(*exec.ExitError); ok {
 					fmt.Printf("    Stderr: %s\n", string(exitError.Stderr))
 				}
 			}
-			fmt.Printf("    Failed to get indirect dependencies (may not be a valid Go module): %s\n", projectDir)
 		}
 		return nil // Not a fatal error, continue processing other projects
-	}
-
-	// Debug: Show first few lines of output
-	if mc.config.Verbose && len(output) > 0 {
-		lines := strings.Split(string(output), "\n")
-		fmt.Printf("    First few lines of go list output:\n")
-		for i, line := range lines {
-			if i >= 3 || line == "" {
-				break
-			}
-			fmt.Printf("      %s\n", line)
-		}
 	}
 
 	// Parse output
@@ -417,12 +433,12 @@ func (mc *ModuleCleaner) analyzeIndirectDependencies(projectDir string) error {
 	}
 
 	if mc.config.Verbose {
-		fmt.Printf("    Found %d modules\n", moduleCount)
-		if moduleCount > 0 && moduleCount <= 10 {
-			fmt.Printf("    Modules added: %v\n", addedModules)
-		} else if moduleCount > 10 {
-			fmt.Printf("    First 5 modules: %v\n", addedModules[:5])
-			fmt.Printf("    Last 5 modules: %v\n", addedModules[moduleCount-5:])
+		fmt.Printf("    Found %d modules via go list\n", moduleCount)
+		if moduleCount > 0 && moduleCount <= 5 {
+			fmt.Printf("    Added modules: %v\n", addedModules)
+		} else if moduleCount > 5 {
+			fmt.Printf("    First 3 modules: %v\n", addedModules[:3])
+			fmt.Printf("    Last 2 modules: %v\n", addedModules[moduleCount-2:])
 		}
 	}
 

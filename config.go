@@ -18,6 +18,8 @@ type Config struct {
 	FastMode bool
 	// MaxWorkers maximum number of concurrent workers for dependency analysis
 	MaxWorkers int
+	// Timeout timeout for go list commands in seconds
+	Timeout int
 }
 
 // DefaultConfig returns default configuration
@@ -32,7 +34,7 @@ func DefaultConfig() *Config {
 }
 
 // NewConfig creates a new configuration instance
-func NewConfig(modulePaths []string, verbose, dryRun, fastMode bool, maxWorkers int) (*Config, error) {
+func NewConfig(modulePaths []string, verbose, dryRun, fastMode bool, maxWorkers, timeout int) (*Config, error) {
 	gomodcache, err := GetGOMODCACHE()
 	if err != nil {
 		return nil, fmt.Errorf("failed to get GOMODCACHE: %w", err)
@@ -43,12 +45,18 @@ func NewConfig(modulePaths []string, verbose, dryRun, fastMode bool, maxWorkers 
 		maxWorkers = 8 // Default to 8 workers for better performance
 	}
 
+	// Set default timeout if not specified or invalid
+	if timeout <= 0 {
+		timeout = 5 // Default to 5 seconds
+	}
+
 	return &Config{
 		ModulePaths: modulePaths,
 		Verbose:     verbose,
 		DryRun:      dryRun,
 		FastMode:    fastMode,
 		MaxWorkers:  maxWorkers,
+		Timeout:     timeout,
 		GoModCache:  gomodcache,
 	}, nil
 }
