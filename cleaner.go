@@ -95,6 +95,28 @@ func (mc *ModuleCleaner) AnalyzeDependencies() error {
 		if len(analysisErrors) > 0 {
 			fmt.Printf("⚠️  %d projects had analysis errors (non-fatal)\n", len(analysisErrors))
 		}
+
+		// Debug: Show total used modules count
+		mc.mutex.RLock()
+		usedCount := len(mc.usedModules)
+		mc.mutex.RUnlock()
+		fmt.Printf("🔍 Total used modules found: %d\n", usedCount)
+
+		// Debug: Show some example used modules
+		if usedCount > 0 {
+			mc.mutex.RLock()
+			examples := make([]string, 0, 5)
+			count := 0
+			for module := range mc.usedModules {
+				if count >= 5 {
+					break
+				}
+				examples = append(examples, module)
+				count++
+			}
+			mc.mutex.RUnlock()
+			fmt.Printf("🔍 Example used modules: %v\n", examples)
+		}
 	}
 
 	return nil
@@ -211,6 +233,13 @@ func (mc *ModuleCleaner) analyzeIndirectDependencies(projectDir string) error {
 	cmd := exec.CommandContext(ctx, "go", "list", "-m", "-json", "all")
 	cmd.Dir = projectDir
 
+	// Debug: Show current environment
+	if mc.config.Verbose {
+		fmt.Printf("    Working directory: %s\n", projectDir)
+		fmt.Printf("    Current GOPROXY: %s\n", os.Getenv("GOPROXY"))
+		fmt.Printf("    Current GOSUMDB: %s\n", os.Getenv("GOSUMDB"))
+	}
+
 	// Set environment variables to avoid network requests
 	cmd.Env = append(os.Environ(), "GOPROXY=direct", "GOSUMDB=off")
 
@@ -220,35 +249,66 @@ func (mc *ModuleCleaner) analyzeIndirectDependencies(projectDir string) error {
 
 	if mc.config.Verbose {
 		fmt.Printf("    go list took: %v\n", duration)
+		fmt.Printf("    Output length: %d bytes\n", len(output))
 	}
 
 	if err != nil {
 		if ctx.Err() == context.DeadlineExceeded {
 			fmt.Printf("⚠️  Warning: Timeout analyzing %s (>30s), skipping indirect dependencies\n", projectDir)
-		} else if mc.config.Verbose {
+		} else {
+			if mc.config.Verbose {
+				fmt.Printf("    Error details: %v\n", err)
+				if exitError, ok := err.(*exec.ExitError); ok {
+					fmt.Printf("    Stderr: %s\n", string(exitError.Stderr))
+				}
+			}
 			fmt.Printf("    Failed to get indirect dependencies (may not be a valid Go module): %s\n", projectDir)
 		}
 		return nil // Not a fatal error, continue processing other projects
 	}
 
+	// Debug: Show first few lines of output
+	if mc.config.Verbose && len(output) > 0 {
+		lines := strings.Split(string(output), "\n")
+		fmt.Printf("    First few lines of go list output:\n")
+		for i, line := range lines {
+			if i >= 3 || line == "" {
+				break
+			}
+			fmt.Printf("      %s\n", line)
+		}
+	}
+
 	// Parse output
 	decoder := json.NewDecoder(strings.NewReader(string(output)))
 	moduleCount := 0
+	addedModules := []string{}
+
 	for decoder.More() {
 		var mod struct {
 			Path string `json:"Path"`
 		}
 		if err := decoder.Decode(&mod); err != nil {
+			if mc.config.Verbose {
+				fmt.Printf("    JSON decode error: %v\n", err)
+			}
 			continue
 		}
 		if mod.Path != "" {
 			mc.addUsedModule(mod.Path)
+			addedModules = append(addedModules, mod.Path)
 			moduleCount++
 		}
 	}
 
 	if mc.config.Verbose {
 		fmt.Printf("    Found %d modules\n", moduleCount)
+		if moduleCount > 0 && moduleCount <= 10 {
+			fmt.Printf("    Modules added: %v\n", addedModules)
+		} else if moduleCount > 10 {
+			fmt.Printf("    First 5 modules: %v\n", addedModules[:5])
+			fmt.Printf("    Last 5 modules: %v\n", addedModules[moduleCount-5:])
+		}
 	}
 
 	return nil
