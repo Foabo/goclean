@@ -4,7 +4,6 @@ import (
 	"flag"
 	"fmt"
 	"os"
-	"strings"
 )
 
 func main() {
@@ -60,9 +59,19 @@ func main() {
 		}
 		fmt.Println() // Add a newline for better readability
 	} else {
-		rawPaths := strings.Split(*modulePaths, ",")
-		for _, path := range rawPaths {
-			paths = append(paths, strings.TrimSpace(path))
+		expandedPaths, err := ParseModulePaths(*modulePaths)
+		if err != nil {
+			fmt.Printf("❌ Error parsing module paths: %v\n", err)
+			os.Exit(1)
+		}
+		paths = expandedPaths
+
+		if *verbose && len(paths) > 0 {
+			fmt.Printf("📂 Expanded module paths:\n")
+			for i, path := range paths {
+				fmt.Printf("   [%d] %s\n", i+1, path)
+			}
+			fmt.Println()
 		}
 	}
 
@@ -136,7 +145,7 @@ Options:
   -version           Show version information
 
 Examples:
-  # Use default settings (8 workers, 5s timeout)
+  # Use default settings (smart project discovery)
   goclean
 
   # High-performance system (16+ cores)
@@ -156,6 +165,14 @@ Examples:
 
   # Dry run to preview (recommended first run)
   goclean -dry-run -verbose
+
+  # Specify module paths (supports various formats):
+  goclean -modules .                                    # Current directory
+  goclean -modules ./myproject                          # Relative path
+  goclean -modules ~/go/src/myproject                   # Home directory
+  goclean -modules $GOPATH/src/company.com/project      # Environment variables
+  goclean -modules /absolute/path/to/project            # Absolute path
+  goclean -modules ".,~/other-project,$GOPATH/src/old"  # Multiple paths (comma-separated)
 
 Notes:
   - Deleting modules may require administrator privileges

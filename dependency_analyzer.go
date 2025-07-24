@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/mod/modfile"
@@ -55,20 +56,27 @@ func (da *DependencyAnalyzer) AnalyzeAllProjects() (*AnalysisResult, error) {
 	var errors []error
 	var errorMutex sync.Mutex
 
+	// Use atomic counters for thread-safe progress tracking
+	var completedCount int64
+	var startedCount int64
+	totalProjects := int64(len(da.config.ModulePaths))
+
 	if da.config.Verbose {
 		fmt.Printf("Using %d concurrent workers for analysis\n", maxWorkers)
 	}
 
 	// Process all projects concurrently
-	for i, modPath := range da.config.ModulePaths {
+	for _, modPath := range da.config.ModulePaths {
 		wg.Add(1)
-		go func(index int, path string) {
+		go func(path string) {
 			defer wg.Done()
 			semaphore <- struct{}{}
 			defer func() { <-semaphore }()
 
+			// Atomic increment for started count
+			started := atomic.AddInt64(&startedCount, 1)
 			if da.config.Verbose {
-				fmt.Printf("[%d/%d] Processing: %s\n", index+1, len(da.config.ModulePaths), path)
+				fmt.Printf("[%d/%d] Processing: %s\n", started, totalProjects, path)
 			}
 
 			if err := da.analyzeProject(path); err != nil {
@@ -77,10 +85,12 @@ func (da *DependencyAnalyzer) AnalyzeAllProjects() (*AnalysisResult, error) {
 				errorMutex.Unlock()
 			}
 
+			// Atomic increment for completed count
+			completed := atomic.AddInt64(&completedCount, 1)
 			if da.config.Verbose {
-				fmt.Printf("✅ [%d/%d] Completed: %s\n", index+1, len(da.config.ModulePaths), path)
+				fmt.Printf("✅ [%d/%d] Completed: %s\n", completed, totalProjects, path)
 			}
-		}(i, modPath)
+		}(modPath)
 	}
 
 	wg.Wait()
@@ -97,28 +107,25 @@ func (da *DependencyAnalyzer) AnalyzeAllProjects() (*AnalysisResult, error) {
 
 // analyzeProject analyzes a single project
 func (da *DependencyAnalyzer) analyzeProject(projectPath string) error {
-	// Expand home directory if needed
-	if strings.HasPrefix(projectPath, "~/") {
-		homeDir, err := os.UserHomeDir()
-		if err != nil {
-			return fmt.Errorf("failed to get home directory: %w", err)
-		}
-		projectPath = filepath.Join(homeDir, projectPath[2:])
+	// Expand path with enhanced path resolution
+	expandedPath, err := ExpandPath(projectPath)
+	if err != nil {
+		return fmt.Errorf("failed to expand path %s: %w", projectPath, err)
 	}
 
 	// Check if path exists
-	info, err := os.Stat(projectPath)
+	info, err := os.Stat(expandedPath)
 	if err != nil {
 		if da.config.Verbose {
-			fmt.Printf("Skipping non-existent path: %s\n", projectPath)
+			fmt.Printf("Skipping non-existent path: %s (expanded from %s)\n", expandedPath, projectPath)
 		}
 		return nil
 	}
 
 	if info.IsDir() {
-		return da.analyzeDirectory(projectPath)
+		return da.analyzeDirectory(expandedPath)
 	} else {
-		return da.analyzeGoModFile(projectPath)
+		return da.analyzeGoModFile(expandedPath)
 	}
 }
 
@@ -303,6 +310,11 @@ func (da *DependencyAnalyzer) analyzeIndirectDependencies(projectDir string) err
 	da.analyzedProjects[absPath] = true
 	da.mutex.Unlock()
 
+	// Check enterprise environment Go proxy configuration
+	if da.config.Verbose {
+		da.checkGoProxyConfiguration()
+	}
+
 	// Execute go list command
 	timeout := time.Duration(da.config.Timeout) * time.Second
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
@@ -315,7 +327,15 @@ func (da *DependencyAnalyzer) analyzeIndirectDependencies(projectDir string) err
 	output, err := cmd.Output()
 	if err != nil {
 		if ctx.Err() == context.DeadlineExceeded {
+			if da.config.Verbose {
+				fmt.Printf("    ⚠️  Warning: go list timeout (%v) for %s - skipping indirect dependencies\n", timeout, projectDir)
+				fmt.Printf("    💡 Hint: Use -fast mode for enterprise environments or adjust -timeout\n")
+			}
 			return fmt.Errorf("go list timeout (%v)", timeout)
+		}
+		if da.config.Verbose {
+			fmt.Printf("    ⚠️  Warning: go list failed for %s: %v\n", projectDir, err)
+			fmt.Printf("    💡 Hint: Check GOPROXY configuration or use -fast mode\n")
 		}
 		return fmt.Errorf("go list failed: %w", err)
 	}
@@ -461,4 +481,43 @@ func (da *DependencyAnalyzer) GetModuleEntries() map[string]*ModuleEntry {
 		}
 	}
 	return result
+}
+
+// checkGoProxyConfiguration checks and displays Go proxy configuration for enterprise environments
+func (da *DependencyAnalyzer) checkGoProxyConfiguration() {
+	// Check important Go environment variables for enterprise setups
+	envVars := map[string]string{
+		"GOPROXY":    os.Getenv("GOPROXY"),
+		"GOPRIVATE":  os.Getenv("GOPRIVATE"),
+		"GOSUMDB":    os.Getenv("GOSUMDB"),
+		"GONOPROXY":  os.Getenv("GONOPROXY"),
+		"GONOSUMDB":  os.Getenv("GONOSUMDB"),
+		"GOINSECURE": os.Getenv("GOINSECURE"),
+	}
+
+	hasCustomConfig := false
+	for _, value := range envVars {
+		if value != "" && value != "proxy.golang.org,direct" && value != "sum.golang.org" {
+			hasCustomConfig = true
+			break
+		}
+	}
+
+	if hasCustomConfig {
+		fmt.Printf("    🔧 Enterprise Go configuration detected:\n")
+		for key, value := range envVars {
+			if value != "" {
+				// Truncate long values for display
+				displayValue := value
+				if len(displayValue) > 50 {
+					displayValue = displayValue[:47] + "..."
+				}
+				fmt.Printf("      %s=%s\n", key, displayValue)
+			}
+		}
+	} else {
+		fmt.Printf("    📡 Using default Go proxy configuration\n")
+		fmt.Printf("    💡 Enterprise users: ensure GOPROXY, GOPRIVATE, etc. are configured\n")
+		fmt.Printf("    🧪 Test: Run 'go list -m -json all' in your project directory\n")
+	}
 }
