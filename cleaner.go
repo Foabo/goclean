@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -17,6 +18,128 @@ import (
 	"golang.org/x/mod/modfile"
 	"golang.org/x/mod/module"
 )
+
+// SemanticVersion represents a semantic version
+type SemanticVersion struct {
+	Major      int
+	Minor      int
+	Patch      int
+	PreRelease string
+	Build      string
+	Original   string
+}
+
+// ParseSemanticVersion parses a semantic version string
+func ParseSemanticVersion(version string) (*SemanticVersion, error) {
+	if version == "" {
+		return nil, fmt.Errorf("empty version string")
+	}
+
+	original := version
+	// Remove 'v' prefix if present
+	if strings.HasPrefix(version, "v") {
+		version = version[1:]
+	}
+
+	// Split pre-release and build metadata
+	var preRelease, build string
+
+	// Handle build metadata (+)
+	if plusIndex := strings.Index(version, "+"); plusIndex != -1 {
+		build = version[plusIndex+1:]
+		version = version[:plusIndex]
+	}
+
+	// Handle pre-release (-)
+	if dashIndex := strings.Index(version, "-"); dashIndex != -1 {
+		preRelease = version[dashIndex+1:]
+		version = version[:dashIndex]
+	}
+
+	// Parse major.minor.patch
+	parts := strings.Split(version, ".")
+	if len(parts) < 1 || len(parts) > 3 {
+		return nil, fmt.Errorf("invalid version format: %s", original)
+	}
+
+	// Ensure we have 3 parts (major.minor.patch)
+	for len(parts) < 3 {
+		parts = append(parts, "0")
+	}
+
+	major, err := strconv.Atoi(parts[0])
+	if err != nil {
+		return nil, fmt.Errorf("invalid major version: %s", parts[0])
+	}
+
+	minor, err := strconv.Atoi(parts[1])
+	if err != nil {
+		return nil, fmt.Errorf("invalid minor version: %s", parts[1])
+	}
+
+	patch, err := strconv.Atoi(parts[2])
+	if err != nil {
+		return nil, fmt.Errorf("invalid patch version: %s", parts[2])
+	}
+
+	return &SemanticVersion{
+		Major:      major,
+		Minor:      minor,
+		Patch:      patch,
+		PreRelease: preRelease,
+		Build:      build,
+		Original:   original,
+	}, nil
+}
+
+// Compare compares two semantic versions
+// Returns: -1 if v < other, 0 if v == other, 1 if v > other
+func (v *SemanticVersion) Compare(other *SemanticVersion) int {
+	// Compare major
+	if v.Major != other.Major {
+		if v.Major < other.Major {
+			return -1
+		}
+		return 1
+	}
+
+	// Compare minor
+	if v.Minor != other.Minor {
+		if v.Minor < other.Minor {
+			return -1
+		}
+		return 1
+	}
+
+	// Compare patch
+	if v.Patch != other.Patch {
+		if v.Patch < other.Patch {
+			return -1
+		}
+		return 1
+	}
+
+	// Compare pre-release
+	if v.PreRelease == "" && other.PreRelease != "" {
+		return 1 // Release > pre-release
+	}
+	if v.PreRelease != "" && other.PreRelease == "" {
+		return -1 // Pre-release < release
+	}
+	if v.PreRelease != other.PreRelease {
+		if v.PreRelease < other.PreRelease {
+			return -1
+		}
+		return 1
+	}
+
+	return 0 // Equal
+}
+
+// String returns the string representation of the version
+func (v *SemanticVersion) String() string {
+	return v.Original
+}
 
 // ModuleCleaner Go module cache cleaner
 type ModuleCleaner struct {
@@ -120,21 +243,40 @@ func (mc *ModuleCleaner) AnalyzeDependencies() error {
 		if mc.config.Verbose && totalModules > 0 {
 			mc.mutex.RLock()
 			count := 0
+			multiVersionCount := 0
 			for modPath, versions := range mc.usedModules {
-				if len(versions) > 1 && count < 3 {
-					var versionList []string
-					for version := range versions {
-						if version != "" {
-							versionList = append(versionList, version)
+				if len(versions) > 1 {
+					multiVersionCount++
+					if count < 3 {
+						var versionList []string
+						for version := range versions {
+							if version != "" {
+								versionList = append(versionList, version)
+							}
 						}
-					}
-					if len(versionList) > 0 {
-						fmt.Printf("  📦 %s: %v\n", modPath, versionList)
-						count++
+						if len(versionList) > 0 {
+							// Sort versions for better display
+							sort.Strings(versionList)
+
+							// Show which version would be kept
+							latestVersion, err := mc.findLatestRequiredVersion(modPath, versionList)
+							latestStr := "unknown"
+							if err == nil {
+								latestStr = latestVersion.String()
+							}
+
+							fmt.Printf("  📦 %s: %v (keeping: %s)\n", modPath, versionList, latestStr)
+							count++
+						}
 					}
 				}
 			}
 			mc.mutex.RUnlock()
+
+			if multiVersionCount > 0 {
+				fmt.Printf("💡 Smart version cleaning: Found %d modules with multiple versions\n", multiVersionCount)
+				fmt.Printf("   Will keep only the latest required version for each module\n")
+			}
 		}
 	}
 
@@ -488,19 +630,60 @@ func (mc *ModuleCleaner) getUsedVersions(modPath string) []string {
 }
 
 // shouldKeepVersion determines if a specific version should be kept
-// For now, we keep all used versions, but this can be enhanced with version comparison logic
+// Uses intelligent version comparison to keep only necessary versions
 func (mc *ModuleCleaner) shouldKeepVersion(modPath, version string) bool {
-	// If the exact version is used, keep it
+	// If the exact version is explicitly used in go.mod, always keep it
 	if mc.isModuleUsed(modPath, version) {
 		return true
 	}
 
-	// If any version is used (from go.sum/vendor without version), keep all versions
-	if mc.isModuleUsedAnyVersion(modPath) {
-		return true
+	// Get all versions used for this module
+	usedVersions := mc.getUsedVersions(modPath)
+
+	// If no specific versions are recorded, fall back to checking if module is used at all
+	if len(usedVersions) == 0 {
+		return mc.isModuleUsedAnyVersion(modPath)
 	}
 
-	return false
+	// Parse current version
+	currentVersion, err := ParseSemanticVersion(version)
+	if err != nil {
+		// If we can't parse the version, keep it if module is used
+		return mc.isModuleUsedAnyVersion(modPath)
+	}
+
+	// Find the latest required version
+	latestRequired, err := mc.findLatestRequiredVersion(modPath, usedVersions)
+	if err != nil {
+		// If we can't determine latest version, keep all versions for safety
+		return mc.isModuleUsedAnyVersion(modPath)
+	}
+
+	// Strategy: Keep only the latest required version and newer
+	// This handles the case where go.sum might have older versions but go.mod requires newer
+	return currentVersion.Compare(latestRequired) >= 0
+}
+
+// findLatestRequiredVersion finds the latest version among all used versions
+func (mc *ModuleCleaner) findLatestRequiredVersion(modPath string, usedVersions []string) (*SemanticVersion, error) {
+	var latestVersion *SemanticVersion
+
+	for _, version := range usedVersions {
+		parsedVersion, err := ParseSemanticVersion(version)
+		if err != nil {
+			continue // Skip unparseable versions
+		}
+
+		if latestVersion == nil || parsedVersion.Compare(latestVersion) > 0 {
+			latestVersion = parsedVersion
+		}
+	}
+
+	if latestVersion == nil {
+		return nil, fmt.Errorf("no valid semantic versions found for module %s", modPath)
+	}
+
+	return latestVersion, nil
 }
 
 // FindVCSCache finds VCS cache entries
@@ -1268,7 +1451,17 @@ func (mc *ModuleCleaner) ShowInteractiveMenu(unusedModules []ModuleInfo) error {
 
 		choice = strings.TrimSpace(choice)
 
-		return mc.handleMenuChoice(choice, unusedModules, vcsCache, &viewedDetails)
+		err = mc.handleMenuChoice(choice, unusedModules, vcsCache, &viewedDetails)
+		if err != nil {
+			return err
+		}
+
+		// Check if user chose to exit or perform deletion
+		if mc.shouldExitMenu(choice, unusedModules, vcsCache, viewedDetails) {
+			return nil
+		}
+
+		// Continue the loop for other choices like viewing details
 	}
 }
 
@@ -1537,4 +1730,20 @@ func (mc *ModuleCleaner) confirmAndRemoveBoth(modules []ModuleInfo, vcsCache []V
 	}
 
 	return nil
+}
+
+// shouldExitMenu checks if the user chose an option that should exit the menu
+func (mc *ModuleCleaner) shouldExitMenu(choice string, unusedModules []ModuleInfo, vcsCache []VCSCacheInfo, viewedDetails bool) bool {
+	optionNum := 1
+
+	// Skip view details option if already viewed
+	if !viewedDetails {
+		if choice == fmt.Sprintf("%d", optionNum) {
+			return false // View details should not exit
+		}
+		optionNum++
+	}
+
+	// All other options (delete, exit) should exit the menu
+	return true
 }
