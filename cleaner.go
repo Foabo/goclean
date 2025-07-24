@@ -198,29 +198,23 @@ func (mc *ModuleCleaner) analyzeGoModFile(goModPath string) error {
 
 	projectDir := filepath.Dir(goModPath)
 
-	// Always try go.sum first (most reliable for enterprise environments)
+	// Try static analysis methods first (they might provide additional info)
 	goSumErr := mc.analyzeGoSumFile(projectDir)
 	vendorErr := mc.analyzeVendorDirectory(projectDir)
 
-	// If both static methods succeeded, don't try go list at all
-	if goSumErr == nil || vendorErr == nil {
-		if mc.config.Verbose {
-			if goSumErr == nil {
-				fmt.Printf("    Successfully used go.sum for dependency analysis\n")
-			} else {
-				fmt.Printf("    Successfully used vendor directory for dependency analysis\n")
-			}
-		}
-		return nil
-	}
-
-	// Only try go list if both static methods failed AND we're not in an enterprise environment
+	// Always try go list for complete dependency analysis, unless we're in fast mode
+	// Static methods are supplementary, not replacement for go list
 	if mc.config.Verbose {
-		fmt.Printf("    Static analysis failed, attempting go list (may timeout)\n")
-		fmt.Printf("    go.sum error: %v\n", goSumErr)
-		fmt.Printf("    vendor error: %v\n", vendorErr)
+		if goSumErr == nil {
+			fmt.Printf("    Successfully supplemented with go.sum analysis\n")
+		} else if vendorErr == nil {
+			fmt.Printf("    Successfully supplemented with vendor analysis\n")
+		} else {
+			fmt.Printf("    No static dependency files found (go.sum/vendor), using go list only\n")
+		}
 	}
 
+	// Always attempt go list for indirect dependencies (unless it times out)
 	return mc.analyzeIndirectDependencies(projectDir)
 }
 
@@ -228,7 +222,7 @@ func (mc *ModuleCleaner) analyzeGoModFile(goModPath string) error {
 func (mc *ModuleCleaner) analyzeGoSumFile(projectDir string) error {
 	goSumPath := filepath.Join(projectDir, "go.sum")
 	if !PathExists(goSumPath) {
-		return fmt.Errorf("go.sum not found")
+		return fmt.Errorf("go.sum not found") // Still return error, but don't log
 	}
 
 	if mc.config.Verbose {
@@ -284,7 +278,7 @@ func (mc *ModuleCleaner) analyzeGoSumFile(projectDir string) error {
 func (mc *ModuleCleaner) analyzeVendorDirectory(projectDir string) error {
 	vendorPath := filepath.Join(projectDir, "vendor")
 	if !PathExists(vendorPath) {
-		return fmt.Errorf("vendor directory not found")
+		return fmt.Errorf("vendor directory not found") // Still return error, but don't log
 	}
 
 	if mc.config.Verbose {
