@@ -21,9 +21,9 @@ import (
 // ModuleCleaner Go module cache cleaner
 type ModuleCleaner struct {
 	config           *Config
-	usedModules      map[string]bool // Set of modules in use
-	mutex            sync.RWMutex    // Protect concurrent access
-	analyzedProjects map[string]bool // Cache for already analyzed projects
+	usedModules      map[string]map[string]bool // Map of module path -> set of versions in use
+	mutex            sync.RWMutex               // Protect concurrent access
+	analyzedProjects map[string]bool            // Cache for already analyzed projects
 }
 
 // ModuleInfo module information
@@ -38,7 +38,7 @@ type ModuleInfo struct {
 func NewModuleCleaner(config *Config) *ModuleCleaner {
 	return &ModuleCleaner{
 		config:           config,
-		usedModules:      make(map[string]bool),
+		usedModules:      make(map[string]map[string]bool),
 		analyzedProjects: make(map[string]bool), // Initialize here to avoid race condition
 	}
 }
@@ -95,6 +95,38 @@ func (mc *ModuleCleaner) AnalyzeDependencies() error {
 		fmt.Printf("📊 Analysis complete: %d projects processed\n", totalPaths)
 		if len(analysisErrors) > 0 {
 			fmt.Printf("⚠️  %d projects had analysis errors (non-fatal)\n", len(analysisErrors))
+		}
+
+		// Show version-aware module statistics
+		mc.mutex.RLock()
+		totalModules := len(mc.usedModules)
+		totalVersions := 0
+		for _, versions := range mc.usedModules {
+			totalVersions += len(versions)
+		}
+		mc.mutex.RUnlock()
+
+		fmt.Printf("🔍 Found %d unique modules with %d total versions\n", totalModules, totalVersions)
+
+		// Show examples of modules with multiple versions
+		if mc.config.Verbose && totalModules > 0 {
+			mc.mutex.RLock()
+			count := 0
+			for modPath, versions := range mc.usedModules {
+				if len(versions) > 1 && count < 3 {
+					var versionList []string
+					for version := range versions {
+						if version != "" {
+							versionList = append(versionList, version)
+						}
+					}
+					if len(versionList) > 0 {
+						fmt.Printf("  📦 %s: %v\n", modPath, versionList)
+						count++
+					}
+				}
+			}
+			mc.mutex.RUnlock()
 		}
 	}
 
@@ -159,12 +191,12 @@ func (mc *ModuleCleaner) analyzeGoModFile(goModPath string) error {
 
 	// Add main module
 	if modFile.Module != nil {
-		mc.addUsedModule(modFile.Module.Mod.Path)
+		mc.addUsedModule(modFile.Module.Mod.Path, modFile.Module.Mod.Version)
 	}
 
 	// Add direct dependencies
 	for _, require := range modFile.Require {
-		mc.addUsedModule(require.Mod.Path)
+		mc.addUsedModule(require.Mod.Path, require.Mod.Version)
 	}
 
 	// Skip indirect dependencies analysis in fast mode
@@ -229,14 +261,20 @@ func (mc *ModuleCleaner) analyzeGoSumFile(projectDir string) error {
 		parts := strings.Fields(line)
 		if len(parts) >= 3 {
 			modulePath := parts[0]
+			moduleVersion := parts[1]
+
+			// Handle /go.mod suffix in version
+			if strings.HasSuffix(moduleVersion, "/go.mod") {
+				moduleVersion = strings.TrimSuffix(moduleVersion, "/go.mod")
+			}
 
 			if modulePath != "" && !processedModules[modulePath] {
-				mc.addUsedModule(modulePath)
+				mc.addUsedModule(modulePath, moduleVersion)
 				processedModules[modulePath] = true
 				moduleCount++
 
 				if mc.config.Verbose && moduleCount <= 5 {
-					fmt.Printf("      Added: %s\n", modulePath)
+					fmt.Printf("      Added: %s@%s\n", modulePath, moduleVersion)
 				}
 			}
 		}
@@ -283,7 +321,7 @@ func (mc *ModuleCleaner) analyzeVendorDirectory(projectDir string) error {
 				parts := strings.Split(relPath, "/")
 				if len(parts) >= 3 {
 					modulePath := strings.Join(parts[:3], "/")
-					mc.addUsedModule(modulePath)
+					mc.addUsedModule(modulePath, "") // No version for vendor entries
 					moduleCount++
 					return filepath.SkipDir // Don't descend into this module
 				}
@@ -376,7 +414,7 @@ func (mc *ModuleCleaner) analyzeIndirectDependencies(projectDir string) error {
 			continue
 		}
 		if mod.Path != "" {
-			mc.addUsedModule(mod.Path)
+			mc.addUsedModule(mod.Path, "") // No version for go list entries
 			moduleCount++
 		}
 	}
@@ -389,17 +427,72 @@ func (mc *ModuleCleaner) analyzeIndirectDependencies(projectDir string) error {
 }
 
 // addUsedModule adds module in use
-func (mc *ModuleCleaner) addUsedModule(modPath string) {
+func (mc *ModuleCleaner) addUsedModule(modPath, modVersion string) {
 	mc.mutex.Lock()
 	defer mc.mutex.Unlock()
-	mc.usedModules[modPath] = true
+
+	if _, exists := mc.usedModules[modPath]; !exists {
+		mc.usedModules[modPath] = make(map[string]bool)
+	}
+	mc.usedModules[modPath][modVersion] = true
 }
 
 // isModuleUsed checks if module is in use
-func (mc *ModuleCleaner) isModuleUsed(modPath string) bool {
+func (mc *ModuleCleaner) isModuleUsed(modPath, modVersion string) bool {
 	mc.mutex.RLock()
 	defer mc.mutex.RUnlock()
-	return mc.usedModules[modPath]
+
+	if _, exists := mc.usedModules[modPath]; !exists {
+		return false
+	}
+	return mc.usedModules[modPath][modVersion]
+}
+
+// isModuleUsedAnyVersion checks if module is in use in any version
+func (mc *ModuleCleaner) isModuleUsedAnyVersion(modPath string) bool {
+	mc.mutex.RLock()
+	defer mc.mutex.RUnlock()
+
+	if versions, exists := mc.usedModules[modPath]; exists {
+		for _, used := range versions {
+			if used {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// getUsedVersions gets all versions in use for a module
+func (mc *ModuleCleaner) getUsedVersions(modPath string) []string {
+	mc.mutex.RLock()
+	defer mc.mutex.RUnlock()
+
+	var versions []string
+	if moduleVersions, exists := mc.usedModules[modPath]; exists {
+		for version, used := range moduleVersions {
+			if used && version != "" {
+				versions = append(versions, version)
+			}
+		}
+	}
+	return versions
+}
+
+// shouldKeepVersion determines if a specific version should be kept
+// For now, we keep all used versions, but this can be enhanced with version comparison logic
+func (mc *ModuleCleaner) shouldKeepVersion(modPath, version string) bool {
+	// If the exact version is used, keep it
+	if mc.isModuleUsed(modPath, version) {
+		return true
+	}
+
+	// If any version is used (from go.sum/vendor without version), keep all versions
+	if mc.isModuleUsedAnyVersion(modPath) {
+		return true
+	}
+
+	return false
 }
 
 // FindUnusedModules finds unused modules with parallel processing
@@ -548,7 +641,7 @@ func (mc *ModuleCleaner) findUnusedExtractedModules() ([]ModuleInfo, error) {
 		if info.IsDir() && strings.Contains(info.Name(), "@") {
 			// This is a versioned module directory, e.g., github.com/gin-gonic/gin@v1.9.1
 			modPath, version := mc.parseExtractedModulePath(path, cacheDir)
-			if modPath != "" && !mc.isModuleUsed(modPath) {
+			if modPath != "" && !mc.shouldKeepVersion(modPath, version) {
 				// Add module to list first (with placeholder size)
 				moduleInfo := ModuleInfo{
 					Path:    path, // Temporarily store full path for worker identification
@@ -644,25 +737,27 @@ func (mc *ModuleCleaner) findUnusedDownloadedModules() ([]ModuleInfo, error) {
 			strings.HasSuffix(info.Name(), ".info")) {
 
 			modPath := mc.parseDownloadedModulePath(path, downloadDir)
-			if modPath != "" && !mc.isModuleUsed(modPath) {
+			if modPath != "" {
 				version := mc.extractVersionFromPath(path)
-				moduleKey := modPath + "@" + version
+				if !mc.shouldKeepVersion(modPath, version) {
+					moduleKey := modPath + "@" + version
 
-				modulesMutex.Lock()
-				// Only add if not already processed
-				if _, exists := processedModules[moduleKey]; !exists {
-					moduleInfo := &ModuleInfo{
-						Path:    modPath,
-						Version: version,
-						Size:    0, // Will be calculated by workers
-						Type:    "download",
+					modulesMutex.Lock()
+					// Only add if not already processed
+					if _, exists := processedModules[moduleKey]; !exists {
+						moduleInfo := &ModuleInfo{
+							Path:    modPath,
+							Version: version,
+							Size:    0, // Will be calculated by workers
+							Type:    "download",
+						}
+						processedModules[moduleKey] = moduleInfo
+
+						// Send for size calculation
+						sizeChan <- moduleKey
 					}
-					processedModules[moduleKey] = moduleInfo
-
-					// Send for size calculation
-					sizeChan <- moduleKey
+					modulesMutex.Unlock()
 				}
-				modulesMutex.Unlock()
 			}
 		}
 
