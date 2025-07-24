@@ -4,7 +4,6 @@ import (
 	"flag"
 	"fmt"
 	"os"
-	"path/filepath"
 	"strings"
 )
 
@@ -112,36 +111,6 @@ func runCleaner(cleaner *ModuleCleaner) error {
 
 	// Show interactive menu for cleaning
 	return cleaner.ShowInteractiveMenu(unusedModules)
-}
-
-// getDefaultModulePath gets default module scan path
-func getDefaultModulePath() (string, error) {
-	// Try using $GOPATH/src
-	gopath, err := GetGOPATH()
-	if err == nil {
-		srcPath := filepath.Join(gopath, "src")
-		if PathExists(srcPath) {
-			return srcPath, nil
-		}
-	}
-
-	// If GOPATH/src doesn't exist, use common directories under user home
-	homeDir, err := os.UserHomeDir()
-	if err != nil {
-		return "", fmt.Errorf("failed to get user home directory: %w", err)
-	}
-
-	// Check common project directories
-	commonDirs := []string{"go", "code", "projects", "workspace", "dev"}
-	for _, dir := range commonDirs {
-		path := filepath.Join(homeDir, dir)
-		if PathExists(path) {
-			return path, nil
-		}
-	}
-
-	// Finally use user home directory
-	return homeDir, nil
 }
 
 // showUsage displays usage instructions

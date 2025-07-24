@@ -2,20 +2,15 @@ package main
 
 import (
 	"bufio"
-	"context"
-	"encoding/json"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
-	"golang.org/x/mod/modfile"
 	"golang.org/x/mod/module"
 )
 
@@ -37,9 +32,7 @@ func ParseSemanticVersion(version string) (*SemanticVersion, error) {
 
 	original := version
 	// Remove 'v' prefix if present
-	if strings.HasPrefix(version, "v") {
-		version = version[1:]
-	}
+	version = strings.TrimPrefix(version, "v")
 
 	// Split pre-release and build metadata
 	var preRelease, build string
@@ -141,485 +134,149 @@ func (v *SemanticVersion) String() string {
 	return v.Original
 }
 
-// ModuleCleaner Go module cache cleaner
+// ModuleEntry represents a module with complete metadata from go list
+type ModuleEntry struct {
+	Path      string `json:"Path"`      // Module path
+	Version   string `json:"Version"`   // Module version
+	Time      string `json:"Time"`      // Module timestamp (RFC3339 string)
+	Indirect  bool   `json:"Indirect"`  // Whether this is an indirect dependency
+	Dir       string `json:"Dir"`       // Path to extracted module directory
+	GoMod     string `json:"GoMod"`     // Path to .mod file in download cache
+	GoVersion string `json:"GoVersion"` // Required Go version
+	Sum       string `json:"Sum"`       // Module content checksum
+	GoModSum  string `json:"GoModSum"`  // go.mod file checksum
+}
+
+// ModuleCleaner simplified module cache cleaner
 type ModuleCleaner struct {
-	config           *Config
-	usedModules      map[string]map[string]bool // Map of module path -> set of versions in use
-	mutex            sync.RWMutex               // Protect concurrent access
-	analyzedProjects map[string]bool            // Cache for already analyzed projects
-}
-
-// ModuleInfo module information
-type ModuleInfo struct {
-	Path    string // Module path
-	Version string // Version number
-	Size    int64  // Size in bytes
-	Type    string // Type: extracted or download
-}
-
-// VCSCacheInfo VCS cache information
-type VCSCacheInfo struct {
-	Hash     string // VCS cache hash
-	RepoURL  string // Repository URL
-	Size     int64  // Size in bytes
-	LastUsed string // Last access time (if available)
+	config   *Config
+	analyzer *DependencyAnalyzer
 }
 
 // NewModuleCleaner creates new cleaner instance
 func NewModuleCleaner(config *Config) *ModuleCleaner {
 	return &ModuleCleaner{
-		config:           config,
-		usedModules:      make(map[string]map[string]bool),
-		analyzedProjects: make(map[string]bool), // Initialize here to avoid race condition
+		config:   config,
+		analyzer: NewDependencyAnalyzer(config),
 	}
 }
 
-// AnalyzeDependencies analyzes dependencies from all specified module paths
+// AnalyzeDependencies analyzes dependencies using the dependency analyzer
 func (mc *ModuleCleaner) AnalyzeDependencies() error {
-	if mc.config.Verbose {
-		fmt.Printf("🔍 Analyzing %d module paths...\n", len(mc.config.ModulePaths))
-	}
-
-	// Use configurable worker pool for concurrent processing
-	maxWorkers := mc.config.MaxWorkers
-	semaphore := make(chan struct{}, maxWorkers)
-	var wg sync.WaitGroup
-	var analysisErrors []error
-	var errorMutex sync.Mutex
-
-	totalPaths := len(mc.config.ModulePaths)
-	processed := int32(0)
-
-	if mc.config.Verbose {
-		fmt.Printf("Using %d concurrent workers for analysis\n", maxWorkers)
-	}
-
-	for i, modPath := range mc.config.ModulePaths {
-		wg.Add(1)
-		go func(index int, path string) {
-			defer wg.Done()
-			semaphore <- struct{}{}        // Acquire semaphore
-			defer func() { <-semaphore }() // Release semaphore
-
-			if mc.config.Verbose {
-				fmt.Printf("[%d/%d] Processing: %s\n", index+1, totalPaths, path)
-			}
-
-			if err := mc.analyzeModulePath(path); err != nil {
-				errorMutex.Lock()
-				analysisErrors = append(analysisErrors, fmt.Errorf("failed to analyze %s: %w", path, err))
-				errorMutex.Unlock()
-			}
-
-			// Update progress
-			current := atomic.AddInt32(&processed, 1)
-			if mc.config.Verbose {
-				fmt.Printf("✅ [%d/%d] Completed: %s\n", current, totalPaths, path)
-			}
-		}(i, modPath)
-	}
-
-	wg.Wait()
-
-	// Report analysis results
-	if mc.config.Verbose {
-		fmt.Printf("📊 Analysis complete: %d projects processed\n", totalPaths)
-		if len(analysisErrors) > 0 {
-			fmt.Printf("⚠️  %d projects had analysis errors (non-fatal)\n", len(analysisErrors))
-		}
-
-		// Show version-aware module statistics
-		mc.mutex.RLock()
-		totalModules := len(mc.usedModules)
-		totalVersions := 0
-		for _, versions := range mc.usedModules {
-			totalVersions += len(versions)
-		}
-		mc.mutex.RUnlock()
-
-		fmt.Printf("🔍 Found %d unique modules with %d total versions\n", totalModules, totalVersions)
-
-		// Show examples of modules with multiple versions
-		if mc.config.Verbose && totalModules > 0 {
-			mc.mutex.RLock()
-			count := 0
-			multiVersionCount := 0
-			for modPath, versions := range mc.usedModules {
-				if len(versions) > 1 {
-					multiVersionCount++
-					if count < 3 {
-						var versionList []string
-						for version := range versions {
-							if version != "" {
-								versionList = append(versionList, version)
-							}
-						}
-						if len(versionList) > 0 {
-							// Sort versions for better display
-							sort.Strings(versionList)
-
-							// Show which version would be kept
-							latestVersion, err := mc.findLatestRequiredVersion(modPath, versionList)
-							latestStr := "unknown"
-							if err == nil {
-								latestStr = latestVersion.String()
-							}
-
-							fmt.Printf("  📦 %s: %v (keeping: %s)\n", modPath, versionList, latestStr)
-							count++
-						}
-					}
-				}
-			}
-			mc.mutex.RUnlock()
-
-			if multiVersionCount > 0 {
-				fmt.Printf("💡 Smart version cleaning: Found %d modules with multiple versions\n", multiVersionCount)
-				fmt.Printf("   Will keep only the latest required version for each module\n")
-			}
-		}
-	}
-
-	return nil
+	_, err := mc.analyzer.AnalyzeAllProjects()
+	return err
 }
 
-// analyzeModulePath analyzes single module path
-func (mc *ModuleCleaner) analyzeModulePath(modPath string) error {
-	// Expand user directory
-	if strings.HasPrefix(modPath, "~/") {
-		homeDir, err := os.UserHomeDir()
-		if err != nil {
-			return fmt.Errorf("failed to get user home directory: %w", err)
+// shouldKeepVersion determines if a specific version should be kept (simplified version)
+func (mc *ModuleCleaner) shouldKeepVersion(modPath, version string) bool {
+	usedModules := mc.analyzer.GetUsedModules()
+	moduleEntries := mc.analyzer.GetModuleEntries()
+
+	// Strategy 1: Always keep if explicitly used
+	if versions, exists := usedModules[modPath]; exists {
+		if versions[version] {
+			return true
 		}
-		modPath = filepath.Join(homeDir, modPath[2:])
 	}
 
-	info, err := os.Stat(modPath)
-	if err != nil {
-		if mc.config.Verbose {
-			fmt.Printf("Skipping non-existent path: %s\n", modPath)
-		}
-		return nil
-	}
-
-	if info.IsDir() {
-		return mc.analyzeDirectory(modPath)
-	} else {
-		return mc.analyzeGoModFile(modPath)
-	}
-}
-
-// analyzeDirectory recursively analyzes go.mod files in directory
-func (mc *ModuleCleaner) analyzeDirectory(dirPath string) error {
-	return filepath.Walk(dirPath, func(path string, info os.FileInfo, err error) error {
-		if err != nil {
-			return err
-		}
-
-		if info.Name() == "go.mod" {
-			if mc.config.Verbose {
-				fmt.Printf("Analyzing go.mod file: %s\n", path)
-			}
-			return mc.analyzeGoModFile(path)
-		}
-
-		return nil
-	})
-}
-
-// analyzeGoModFile analyzes single go.mod file
-func (mc *ModuleCleaner) analyzeGoModFile(goModPath string) error {
-	content, err := os.ReadFile(goModPath)
-	if err != nil {
-		return fmt.Errorf("failed to read go.mod file: %w", err)
-	}
-
-	modFile, err := modfile.Parse(goModPath, content, nil)
-	if err != nil {
-		return fmt.Errorf("failed to parse go.mod file: %w", err)
-	}
-
-	// Add main module
-	if modFile.Module != nil {
-		mc.addUsedModule(modFile.Module.Mod.Path, modFile.Module.Mod.Version)
-	}
-
-	// Add direct dependencies
-	for _, require := range modFile.Require {
-		mc.addUsedModule(require.Mod.Path, require.Mod.Version)
-	}
-
-	// Skip indirect dependencies analysis in fast mode
-	if mc.config.FastMode {
-		if mc.config.Verbose {
-			fmt.Printf("    Fast mode: skipping indirect dependencies for %s\n", filepath.Dir(goModPath))
-		}
-		return nil
-	}
-
-	projectDir := filepath.Dir(goModPath)
-
-	// Try static analysis methods first (they might provide additional info)
-	goSumErr := mc.analyzeGoSumFile(projectDir)
-	vendorErr := mc.analyzeVendorDirectory(projectDir)
-
-	// Always try go list for complete dependency analysis, unless we're in fast mode
-	// Static methods are supplementary, not replacement for go list
-	if mc.config.Verbose {
-		if goSumErr == nil {
-			fmt.Printf("    Successfully supplemented with go.sum analysis\n")
-		} else if vendorErr == nil {
-			fmt.Printf("    Successfully supplemented with vendor analysis\n")
+	// Strategy 2: Enhanced logic using ModuleEntry metadata
+	moduleKey := fmt.Sprintf("%s@%s", modPath, version)
+	if entry, hasMetadata := moduleEntries[moduleKey]; hasMetadata {
+		// Use intelligent cleaning based on direct/indirect status
+		if entry.Indirect {
+			return mc.shouldKeepIndirectDependency(modPath, version, usedModules)
 		} else {
-			fmt.Printf("    No static dependency files found (go.sum/vendor), using go list only\n")
+			return mc.shouldKeepDirectDependency(modPath, version, usedModules)
 		}
 	}
 
-	// Always attempt go list for indirect dependencies (unless it times out)
-	return mc.analyzeIndirectDependencies(projectDir)
+	// Strategy 3: Fallback to basic version logic
+	return mc.shouldKeepVersionBasic(modPath, version, usedModules)
 }
 
-// analyzeGoSumFile analyzes go.sum file to extract all used modules
-func (mc *ModuleCleaner) analyzeGoSumFile(projectDir string) error {
-	goSumPath := filepath.Join(projectDir, "go.sum")
-	if !PathExists(goSumPath) {
-		return nil // File doesn't exist, but this is not an error condition
+// shouldKeepVersionBasic implements basic version keeping logic
+func (mc *ModuleCleaner) shouldKeepVersionBasic(modPath, version string, usedModules map[string]map[string]bool) bool {
+	usedVersions := mc.getUsedVersionsFromMap(modPath, usedModules)
+	if len(usedVersions) == 0 {
+		return false // No versions in use, can remove
 	}
 
-	if mc.config.Verbose {
-		fmt.Printf("    Analyzing go.sum file: %s\n", goSumPath)
-	}
-
-	content, err := os.ReadFile(goSumPath)
+	currentVersion, err := ParseSemanticVersion(version)
 	if err != nil {
-		return fmt.Errorf("failed to read go.sum: %w", err)
+		return true // Keep if can't parse version for safety
 	}
 
-	moduleCount := 0
-	processedModules := make(map[string]bool)
-
-	lines := strings.Split(string(content), "\n")
-	for _, line := range lines {
-		line = strings.TrimSpace(line)
-		if line == "" || strings.HasPrefix(line, "//") {
-			continue
-		}
-
-		// go.sum format: module version hash
-		// Example: github.com/gin-gonic/gin v1.9.1 h1:abc123...
-		// Also handle /go.mod entries: github.com/gin-gonic/gin v1.9.1/go.mod h1:def456...
-		parts := strings.Fields(line)
-		if len(parts) >= 3 {
-			modulePath := parts[0]
-			moduleVersion := parts[1]
-
-			// Handle /go.mod suffix in version
-			if strings.HasSuffix(moduleVersion, "/go.mod") {
-				moduleVersion = strings.TrimSuffix(moduleVersion, "/go.mod")
-			}
-
-			if modulePath != "" && !processedModules[modulePath] {
-				mc.addUsedModule(modulePath, moduleVersion)
-				processedModules[modulePath] = true
-				moduleCount++
-
-				if mc.config.Verbose && moduleCount <= 5 {
-					fmt.Printf("      Added: %s@%s\n", modulePath, moduleVersion)
-				}
-			}
-		}
-	}
-
-	if mc.config.Verbose {
-		fmt.Printf("    Found %d unique modules from go.sum\n", moduleCount)
-	}
-
-	return nil // Always return success, even if no modules found
-}
-
-// analyzeVendorDirectory analyzes vendor directory to find used modules
-func (mc *ModuleCleaner) analyzeVendorDirectory(projectDir string) error {
-	vendorPath := filepath.Join(projectDir, "vendor")
-	if !PathExists(vendorPath) {
-		return nil // Directory doesn't exist, but this is not an error condition
-	}
-
-	if mc.config.Verbose {
-		fmt.Printf("    Analyzing vendor directory: %s\n", vendorPath)
-	}
-
-	moduleCount := 0
-	err := filepath.Walk(vendorPath, func(path string, info os.FileInfo, err error) error {
-		if err != nil {
-			return nil // Skip errors
-		}
-
-		if info.IsDir() {
-			relPath, err := filepath.Rel(vendorPath, path)
-			if err != nil {
-				return nil
-			}
-
-			// Skip if this is the vendor root or a version directory
-			if relPath == "." || strings.Contains(relPath, "@") {
-				return nil
-			}
-
-			// Check if this looks like a module path
-			if strings.Count(relPath, "/") >= 2 { // e.g., github.com/user/repo
-				// Get the module root (first 3 path segments for github.com style)
-				parts := strings.Split(relPath, "/")
-				if len(parts) >= 3 {
-					modulePath := strings.Join(parts[:3], "/")
-					mc.addUsedModule(modulePath, "") // No version for vendor entries
-					moduleCount++
-					return filepath.SkipDir // Don't descend into this module
-				}
-			}
-		}
-
-		return nil
-	})
-
-	if mc.config.Verbose {
-		fmt.Printf("    Found %d modules from vendor directory\n", moduleCount)
-	}
-
-	return err // Return the walk error if any, but missing directory is not an error
-}
-
-// analyzeIndirectDependencies analyzes indirect dependencies (optimized version)
-func (mc *ModuleCleaner) analyzeIndirectDependencies(projectDir string) error {
-	absProjectDir, err := filepath.Abs(projectDir)
+	latestRequired, err := mc.findLatestRequiredVersion(modPath, usedVersions)
 	if err != nil {
-		absProjectDir = projectDir
+		return true // Keep if can't determine latest for safety
 	}
 
-	// Protect analyzedProjects map access with mutex
-	mc.mutex.Lock()
-	if mc.analyzedProjects[absProjectDir] {
-		mc.mutex.Unlock()
-		if mc.config.Verbose {
-			fmt.Printf("  Skipping already analyzed project: %s\n", projectDir)
-		}
-		return nil
-	}
-	mc.analyzedProjects[absProjectDir] = true
-	mc.mutex.Unlock()
-
-	if mc.config.Verbose {
-		fmt.Printf("  Analyzing indirect dependencies for: %s\n", projectDir)
-	}
-
-	// Use configurable timeout from command line
-	timeout := time.Duration(mc.config.Timeout) * time.Second
-
-	// Allow environment variable to override if set
-	if customTimeout := os.Getenv("GOCLEAN_TIMEOUT"); customTimeout != "" {
-		if parsedTimeout, err := time.ParseDuration(customTimeout); err == nil {
-			timeout = parsedTimeout
-		}
-	}
-
-	// Create context with configurable timeout
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
-	defer cancel()
-
-	cmd := exec.CommandContext(ctx, "go", "list", "-m", "-json", "all")
-	cmd.Dir = projectDir
-
-	// Always respect existing environment in enterprise settings
-	cmd.Env = os.Environ()
-
-	start := time.Now()
-	output, err := cmd.Output()
-	duration := time.Since(start)
-
-	if mc.config.Verbose {
-		fmt.Printf("    go list took: %v\n", duration)
-	}
-
-	if err != nil {
-		if ctx.Err() == context.DeadlineExceeded {
-			fmt.Printf("⚠️  Warning: go list timeout (%v) for %s - skipping indirect dependencies\n", timeout, projectDir)
-			if mc.config.Verbose {
-				fmt.Printf("    This is expected in enterprise environments with private repositories\n")
-				fmt.Printf("    The tool will continue using go.mod + go.sum analysis only\n")
-			}
-		} else if mc.config.Verbose {
-			fmt.Printf("    go list error for %s: %v\n", projectDir, err)
-		}
-		return nil // Not a fatal error, continue processing other projects
-	}
-
-	// Parse output
-	decoder := json.NewDecoder(strings.NewReader(string(output)))
-	moduleCount := 0
-
-	for decoder.More() {
-		var mod struct {
-			Path string `json:"Path"`
-		}
-		if err := decoder.Decode(&mod); err != nil {
-			continue
-		}
-		if mod.Path != "" {
-			mc.addUsedModule(mod.Path, "") // No version for go list entries
-			moduleCount++
-		}
-	}
-
-	if mc.config.Verbose {
-		fmt.Printf("    Found %d modules via go list\n", moduleCount)
-	}
-
-	return nil
+	// Keep only the latest required version and newer
+	return currentVersion.Compare(latestRequired) >= 0
 }
 
-// addUsedModule adds module in use
-func (mc *ModuleCleaner) addUsedModule(modPath, modVersion string) {
-	mc.mutex.Lock()
-	defer mc.mutex.Unlock()
-
-	if _, exists := mc.usedModules[modPath]; !exists {
-		mc.usedModules[modPath] = make(map[string]bool)
+// shouldKeepIndirectDependency implements aggressive cleaning for indirect dependencies
+func (mc *ModuleCleaner) shouldKeepIndirectDependency(modPath, version string, usedModules map[string]map[string]bool) bool {
+	// For indirect dependencies, be more aggressive
+	if _, exists := usedModules[modPath]; !exists {
+		return false // Module not used anywhere
 	}
-	mc.usedModules[modPath][modVersion] = true
-}
 
-// isModuleUsed checks if module is in use
-func (mc *ModuleCleaner) isModuleUsed(modPath, modVersion string) bool {
-	mc.mutex.RLock()
-	defer mc.mutex.RUnlock()
-
-	if _, exists := mc.usedModules[modPath]; !exists {
+	usedVersions := mc.getUsedVersionsFromMap(modPath, usedModules)
+	if len(usedVersions) == 0 {
 		return false
 	}
-	return mc.usedModules[modPath][modVersion]
+
+	currentVersion, err := ParseSemanticVersion(version)
+	if err != nil {
+		return true // Keep if can't parse for safety
+	}
+
+	latestRequired, err := mc.findLatestRequiredVersion(modPath, usedVersions)
+	if err != nil {
+		return true // Keep if can't determine latest for safety
+	}
+
+	// Aggressive: Only keep if this IS the latest required version
+	return currentVersion.Compare(latestRequired) == 0
 }
 
-// isModuleUsedAnyVersion checks if module is in use in any version
-func (mc *ModuleCleaner) isModuleUsedAnyVersion(modPath string) bool {
-	mc.mutex.RLock()
-	defer mc.mutex.RUnlock()
-
-	if versions, exists := mc.usedModules[modPath]; exists {
-		for _, used := range versions {
-			if used {
-				return true
-			}
+// shouldKeepDirectDependency implements conservative cleaning for direct dependencies
+func (mc *ModuleCleaner) shouldKeepDirectDependency(modPath, version string, usedModules map[string]map[string]bool) bool {
+	// For direct dependencies, be more conservative
+	if versions, exists := usedModules[modPath]; exists {
+		if versions[version] {
+			return true // Always keep if explicitly listed
 		}
 	}
-	return false
+
+	if _, exists := usedModules[modPath]; !exists {
+		return false // Module not used anywhere
+	}
+
+	usedVersions := mc.getUsedVersionsFromMap(modPath, usedModules)
+	if len(usedVersions) == 0 {
+		return false
+	}
+
+	currentVersion, err := ParseSemanticVersion(version)
+	if err != nil {
+		return true // Keep if can't parse for safety
+	}
+
+	latestRequired, err := mc.findLatestRequiredVersion(modPath, usedVersions)
+	if err != nil {
+		return true // Keep if can't determine latest for safety
+	}
+
+	// Conservative: Keep latest required version and newer (for compatibility)
+	return currentVersion.Compare(latestRequired) >= 0
 }
 
-// getUsedVersions gets all versions in use for a module
-func (mc *ModuleCleaner) getUsedVersions(modPath string) []string {
-	mc.mutex.RLock()
-	defer mc.mutex.RUnlock()
-
+// getUsedVersionsFromMap gets all versions in use for a module from the provided map
+func (mc *ModuleCleaner) getUsedVersionsFromMap(modPath string, usedModules map[string]map[string]bool) []string {
 	var versions []string
-	if moduleVersions, exists := mc.usedModules[modPath]; exists {
+	if moduleVersions, exists := usedModules[modPath]; exists {
 		for version, used := range moduleVersions {
 			if used && version != "" {
 				versions = append(versions, version)
@@ -627,41 +284,6 @@ func (mc *ModuleCleaner) getUsedVersions(modPath string) []string {
 		}
 	}
 	return versions
-}
-
-// shouldKeepVersion determines if a specific version should be kept
-// Uses intelligent version comparison to keep only necessary versions
-func (mc *ModuleCleaner) shouldKeepVersion(modPath, version string) bool {
-	// If the exact version is explicitly used in go.mod, always keep it
-	if mc.isModuleUsed(modPath, version) {
-		return true
-	}
-
-	// Get all versions used for this module
-	usedVersions := mc.getUsedVersions(modPath)
-
-	// If no specific versions are recorded, fall back to checking if module is used at all
-	if len(usedVersions) == 0 {
-		return mc.isModuleUsedAnyVersion(modPath)
-	}
-
-	// Parse current version
-	currentVersion, err := ParseSemanticVersion(version)
-	if err != nil {
-		// If we can't parse the version, keep it if module is used
-		return mc.isModuleUsedAnyVersion(modPath)
-	}
-
-	// Find the latest required version
-	latestRequired, err := mc.findLatestRequiredVersion(modPath, usedVersions)
-	if err != nil {
-		// If we can't determine latest version, keep all versions for safety
-		return mc.isModuleUsedAnyVersion(modPath)
-	}
-
-	// Strategy: Keep only the latest required version and newer
-	// This handles the case where go.sum might have older versions but go.mod requires newer
-	return currentVersion.Compare(latestRequired) >= 0
 }
 
 // findLatestRequiredVersion finds the latest version among all used versions
@@ -684,6 +306,22 @@ func (mc *ModuleCleaner) findLatestRequiredVersion(modPath string, usedVersions 
 	}
 
 	return latestVersion, nil
+}
+
+// ModuleInfo module information
+type ModuleInfo struct {
+	Path    string // Module path
+	Version string // Version number
+	Size    int64  // Size in bytes
+	Type    string // Type: extracted or download
+}
+
+// VCSCacheInfo VCS cache information
+type VCSCacheInfo struct {
+	Hash     string // VCS cache hash
+	RepoURL  string // Repository URL
+	Size     int64  // Size in bytes
+	LastUsed string // Last access time (if available)
 }
 
 // FindVCSCache finds VCS cache entries
@@ -1073,7 +711,7 @@ func (mc *ModuleCleaner) findUnusedDownloadedModules() ([]ModuleInfo, error) {
 				if moduleInfo, exists := processedModules[moduleKey]; exists {
 					// Calculate size for this module
 					modPath := moduleInfo.Path
-					size := mc.calculateModuleDownloadSize("", downloadDir, modPath)
+					size := mc.calculateModuleDownloadSize(downloadDir, modPath)
 					moduleInfo.Size = size
 				}
 				modulesMutex.Unlock()
@@ -1203,7 +841,7 @@ func (mc *ModuleCleaner) extractVersionFromPath(path string) string {
 }
 
 // calculateModuleDownloadSize calculates total size of downloaded module
-func (mc *ModuleCleaner) calculateModuleDownloadSize(samplePath, downloadDir, modPath string) int64 {
+func (mc *ModuleCleaner) calculateModuleDownloadSize(downloadDir, modPath string) int64 {
 	var totalSize int64
 
 	escapedPath, err := module.EscapePath(modPath)
@@ -1315,8 +953,9 @@ func (mc *ModuleCleaner) RemoveUnusedModules(modules []ModuleInfo) error {
 	return nil
 }
 
-// removeModule removes single module
+// removeModule removes single module using intelligent method
 func (mc *ModuleCleaner) removeModule(mod ModuleInfo) error {
+	// Use traditional type-based removal
 	switch mod.Type {
 	case "extracted":
 		return mc.removeExtractedModule(mod)
